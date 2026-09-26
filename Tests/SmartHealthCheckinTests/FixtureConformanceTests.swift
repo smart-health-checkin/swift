@@ -14,7 +14,8 @@
 //   - SessionTranscript bytes ARE deterministic (a function of EI b64u + origin)
 //     so we DO byte-compare those when a fixture pins them.
 //
-// All paths are relative to the SwiftPM package root (`examples/swift-ios/`).
+// The fixtures are the spec's, at the tag pinned in scripts/fetch-fixtures.sh,
+// fetched into the gitignored `fixtures/` at the package root.
 //
 // Coverage:
 //   C1  ts-smart-checkin-basic       — synthetic TS-generated request
@@ -36,11 +37,14 @@ final class FixtureConformanceTests: XCTestCase {
 
     // MARK: - Path helpers
 
-    /// Repo-relative fixtures root. SwiftPM tests run from the package root,
-    /// which is `examples/swift-ios/` → fixtures live two levels up.
+    /// `fixtures/` at the package root (run scripts/fetch-fixtures.sh first),
+    /// found from this file so it doesn't depend on the working directory.
     static let fixturesRoot: URL = {
-        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("../../fixtures")
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()      // SmartHealthCheckinTests/
+            .deletingLastPathComponent()      // Tests/
+            .deletingLastPathComponent()      // package root
+            .appendingPathComponent("fixtures")
             .standardizedFileURL
     }()
 

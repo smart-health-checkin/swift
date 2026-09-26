@@ -2,3 +2,7 @@
 .swiftpm/
 *.xcodeproj/
 DerivedData/
+
+# The spec's fixtures, fetched by tag (scripts/fetch-fixtures.sh)
+fixtures/
+.cache/
