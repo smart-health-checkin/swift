@@ -24,10 +24,10 @@
 //
 //   DeviceSigned = {
 //     "nameSpaces": Tag(24, bstr .cbor {}),  -- empty map by default
-//     "deviceAuth": { "deviceSignature": COSE_Sign1 (attached payload, ES256) }
+//     "deviceAuth": { "deviceSignature": COSE_Sign1 (detached payload, ES256) }
 //   }
 //
-//   The COSE payload of deviceSignature is the DeviceAuthentication bytes:
+//   The deviceSignature signs (detached) the DeviceAuthentication bytes:
 //   DeviceAuthentication = Tag(24, bstr .cbor [
 //     "DeviceAuthentication",
 //     SessionTranscript,
@@ -424,9 +424,12 @@ public enum DeviceResponseBuilder {
             deviceNamespacesTag24Bytes: deviceNamespacesTag24Bytes
         )
         let deviceProtected = COSESign1Signer.es256ProtectedHeader()
+        // ISO 18013-5: the device signature's payload is detached (null);
+        // the verifier rebuilds DeviceAuthenticationBytes from its own
+        // session transcript.
         let deviceSig = try COSESign1Signer.sign(
             payload: deviceAuthBytes,
-            attached: true,
+            attached: false,
             privateKey: deviceKey,
             protectedBytes: deviceProtected
         )
