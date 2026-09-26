@@ -1,6 +1,8 @@
 # SmartHealthCheckin
 
-A Swift Package implementing **[SMART Health Check‑in 1.0](https://joshuamandel.com/smart-health-checkin-mdoc/llms.txt)** — a same‑device W3C Digital Credentials API protocol for clinical check‑in, layered on top of `org-iso-mdoc` (CBOR + COSE_Sign1 + HPKE).
+> Moved out of [smart-health-checkin/spec](https://github.com/smart-health-checkin/spec) (`examples/swift-ios`) with its history. There's no reference iOS wallet for the connectathon; this package is exploratory.
+
+A Swift Package implementing **[SMART Health Check‑in 1.0](https://smart-health-checkin.org/spec/llms.txt)** — a same‑device W3C Digital Credentials API protocol for clinical check‑in, layered on top of `org-iso-mdoc` (CBOR + COSE_Sign1 + HPKE).
 
 The package exposes both **Verifier** (clinic / kiosk) and **Wallet** (patient app) roles, plus the underlying primitives (clinical model, deterministic CBOR, COSE_Sign1, HPKE binding, x509) so applications can compose their own flows.
 
