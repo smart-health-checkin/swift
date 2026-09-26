@@ -71,53 +71,70 @@ final class SpecConformanceTests: XCTestCase {
         let outputs = (c["expected"] as! [String: Any])["outputs"] as! [String: String]
         return try Data(contentsOf: Self.casesRoot.appendingPathComponent(outputs[key]!))
     }
-    private func expectedValid(_ c: [String: Any]) -> Bool { (c["expected"] as! [String: Any])["valid"] as! Bool }
+    private func outcome(_ c: [String: Any]) -> String { (c["expected"] as! [String: Any])["outcome"] as! String }
+    private func hasOutput(_ c: [String: Any], _ key: String) -> Bool {
+        ((c["expected"] as! [String: Any])["outputs"] as? [String: String])?[key] != nil
+    }
+
+    /// `attempt` throws when the library rejects the input and otherwise returns
+    /// whether its outputs match. accept and warn both require accepting;
+    /// reporting the warning is advisory (RCV-1).
+    private func judge(_ c: [String: Any], _ attempt: () throws -> Bool) -> Bool {
+        let result: Bool?
+        do { result = try attempt() } catch { result = nil }
+        switch outcome(c) {
+        case "reject": return result == nil
+        case "warn-or-reject": return result != false
+        default: return result == true
+        }
+    }
+    private struct Rejected: Error {}
 
     /// Did the library reach the expected verdict (and outputs)?
     private func run(_ c: [String: Any]) throws -> Bool {
-        let valid = expectedValid(c)
-        func verdict(_ check: () throws -> Bool) -> Bool {
-            do { return try check() == valid } catch { return !valid }
-        }
         switch c["capability"] as! String {
         case "request-json":
-            return verdict {
+            return judge(c) {
                 let r = try SmartHealthCheckinRequest.parse(try data(c, "request"))
-                return !SmartHealthCheckinValidator.validate(request: r).hasErrors
+                if SmartHealthCheckinValidator.validate(request: r).hasErrors { throw Rejected() }
+                return true
             }
         case "response-json":
-            return verdict { _ = try SmartHealthCheckinResponse.parse(try data(c, "response")); return true }
+            return judge(c) { _ = try SmartHealthCheckinResponse.parse(try data(c, "response")); return true }
         case "cross-validation":
-            return verdict {
+            return judge(c) {
                 let req = try SmartHealthCheckinRequest.parse(try data(c, "request"))
                 let resp = try SmartHealthCheckinResponse.parse(try data(c, "response"))
-                return !SmartHealthCheckinValidator.crossValidate(request: req, response: resp).hasErrors
+                if SmartHealthCheckinValidator.crossValidate(request: req, response: resp).hasErrors { throw Rejected() }
+                return true
             }
         case "request-cbor":
-            return verdict {
+            return judge(c) {
                 let (dr, ei) = try mdocRequestData(try data(c, "navigatorArgument"))
                 let (parsed, _) = try CheckinWallet.handleRequest(deviceRequestBase64Url: dr, encryptionInfoBase64Url: ei, origin: "https://clinic.example")
                 _ = try EncryptionInfo.decode(try Base64URL.decode(ei))
-                if parsed.smartRequestValidation.hasErrors { return false }
-                if !valid { return true }
+                if parsed.smartRequestValidation.hasErrors { throw Rejected() }
+                if !hasOutput(c, "smartRequest") { return true }
                 return try sameJSON(parsed.smartRequest.toJSONData(), try output(c, "smartRequest"))
             }
         case "transcript":
             let t = SessionTranscript.dcapi(encryptionInfoBase64Url: try text(c, "encryptionInfo"), origin: try text(c, "origin"))
             return t == (try output(c, "sessionTranscript"))
         case "hpke-open":
-            return verdict {
+            return judge(c) {
                 let plaintext = try open(c)
-                return valid ? plaintext == (try output(c, "deviceResponse")) : true
+                return !hasOutput(c, "deviceResponse") || plaintext == (try output(c, "deviceResponse"))
             }
         case "mdoc-verify":
-            return verdict {
+            return judge(c) {
                 let parsed = try DeviceResponseParser.parse(try data(c, "deviceResponse"))
                 let v = try DeviceResponseValidator.validate(parsed, sessionTranscript: try data(c, "sessionTranscript"), options: .init(
                     docType: SmartHealthCheckinConstants.mdocDocType,
                     namespace: SmartHealthCheckinConstants.mdocNamespace,
                     element: SmartHealthCheckinConstants.mdocElementIdentifier))
-                return v.issuerSignatureValid && v.deviceSignatureValid && v.digestMatch
+                // The package's verifier accepts only when every signature and digest verifies.
+                if !(v.issuerSignatureValid && v.deviceSignatureValid && v.digestMatch) { throw Rejected() }
+                return true
             }
         case "wallet-response":
             let (dr, ei) = try mdocRequestData(try data(c, "navigatorArgument"))
@@ -148,8 +165,7 @@ final class SpecConformanceTests: XCTestCase {
     /// Verifier side: open a credential with the case's key and transcript.
     private func open(_ c: [String: Any]) throws -> Data {
         let cred = try JSONSerialization.jsonObject(with: try data(c, "credential")) as! [String: Any]
-        guard (cred["protocol"] as? String) == "org-iso-mdoc",
-              let response = (cred["data"] as? [String: Any])?["response"] as? String else {
+        guard let response = (cred["data"] as? [String: Any])?["response"] as? String else {
             throw NSError(domain: "conformance", code: 3)
         }
         let key = try FixtureConformanceTests.loadP256KeyAgreementPrivateKeyFromJWK(url: url(c, "recipientPrivateJwk"))
