@@ -14,15 +14,15 @@
 //   - SessionTranscript bytes ARE deterministic (a function of EI b64u + origin)
 //     so we DO byte-compare those when a fixture pins them.
 //
-// The fixtures are the spec's, at the tag pinned in scripts/fetch-fixtures.sh,
+// The fixtures are the spec's, at the tag pinned in scripts/fetch-spec.sh,
 // fetched into the gitignored `fixtures/` at the package root.
 //
 // Coverage:
-//   C1  ts-smart-checkin-basic       — synthetic TS-generated request
-//   C2  ts-smart-checkin-readerauth  — TS-generated request with detached readerAuth
-//   C3  real-chrome-android-…        — real captured Chrome+Android Credential Manager
+//   C1  synthetic-basic              — synthetic request
+//   C2  synthetic-reader-auth        — synthetic request with detached readerAuth
+//   C3  android-chrome-capture       — real captured Chrome+Android Credential Manager
 //   C4  negative-mattr-mdl           — non-SMART mDL request must be rejected
-//   C5  responses/real-chrome-…      — full HPKE-open + DeviceResponse + MSO + devSig
+//   C5  responses/android-chrome-capture — full HPKE-open + DeviceResponse + MSO + devSig
 //   C6  responses/pymdoc-minimal     — Python pyMDOC issuer-only Document; verify
 //                                      tag-24 IssuerSignedItem digest matches MSO.
 
@@ -37,7 +37,7 @@ final class FixtureConformanceTests: XCTestCase {
 
     // MARK: - Path helpers
 
-    /// `fixtures/` at the package root (run scripts/fetch-fixtures.sh first),
+    /// `fixtures/` at the package root (run scripts/fetch-spec.sh first),
     /// found from this file so it doesn't depend on the working directory.
     static let fixturesRoot: URL = {
         URL(fileURLWithPath: #filePath)
@@ -169,10 +169,10 @@ final class FixtureConformanceTests: XCTestCase {
         }
     }
 
-    // MARK: - C1: ts-smart-checkin-basic
+    // MARK: - C1: synthetic-basic
 
     func testC1_ts_smart_checkin_basic() throws {
-        let dir = Self.fixture("dcapi-requests/ts-smart-checkin-basic")
+        let dir = Self.fixture("dcapi-requests/synthetic-basic")
         try requireFixture(dir.appendingPathComponent("request.json"))
         let metadataURL = dir.appendingPathComponent("metadata.json")
         guard case .object(let m) = try Self.loadStrictJSON(metadataURL),
@@ -182,7 +182,7 @@ final class FixtureConformanceTests: XCTestCase {
         let fixture = try parseRequestFixture(dir, origin: origin)
         let dr = try XCTUnwrap(fixture.parsedRequest.docRequests.first)
         XCTAssertEqual(dr.itemsRequest.docType, SmartHealthCheckinConstants.mdocDocType)
-        XCTAssertNil(dr.readerAuth, "ts-smart-checkin-basic does not carry readerAuth")
+        XCTAssertNil(dr.readerAuth, "synthetic-basic does not carry readerAuth")
 
         // Smart request semantic equality with smart-request.expected.json.
         let expected = try Data(contentsOf: dir.appendingPathComponent("smart-request.expected.json"))
@@ -201,10 +201,10 @@ final class FixtureConformanceTests: XCTestCase {
         XCTAssertFalse(SmartHealthCheckinValidator.validate(request: parsed).hasErrors)
     }
 
-    // MARK: - C2: ts-smart-checkin-readerauth
+    // MARK: - C2: synthetic-reader-auth
 
     func testC2_ts_smart_checkin_readerauth() throws {
-        let dir = Self.fixture("dcapi-requests/ts-smart-checkin-readerauth")
+        let dir = Self.fixture("dcapi-requests/synthetic-reader-auth")
         try requireFixture(dir.appendingPathComponent("request.json"))
         guard case .object(let m) = try Self.loadStrictJSON(dir.appendingPathComponent("metadata.json")),
               case .string(let origin) = m.first(where: { $0.key == "origin" })?.value ?? .null
@@ -212,7 +212,7 @@ final class FixtureConformanceTests: XCTestCase {
 
         let fixture = try parseRequestFixture(dir, origin: origin)
         let dr = try XCTUnwrap(fixture.parsedRequest.docRequests.first)
-        let readerAuth = try XCTUnwrap(dr.readerAuth, "ts-smart-checkin-readerauth must carry readerAuth")
+        let readerAuth = try XCTUnwrap(dr.readerAuth, "synthetic-reader-auth must carry readerAuth")
 
         // Semantic SMART request equality.
         let expected = try Data(contentsOf: dir.appendingPathComponent("smart-request.expected.json"))
@@ -242,10 +242,10 @@ final class FixtureConformanceTests: XCTestCase {
         }
     }
 
-    // MARK: - C3: real-chrome-android-smart-checkin (request side)
+    // MARK: - C3: android-chrome-capture (request side)
 
-    func testC3_real_chrome_android_request() throws {
-        let dir = Self.fixture("dcapi-requests/real-chrome-android-smart-checkin")
+    func testC3_android_chrome_capture_request() throws {
+        let dir = Self.fixture("dcapi-requests/android-chrome-capture")
         try requireFixture(dir.appendingPathComponent("request.json"))
         guard case .object(let m) = try Self.loadStrictJSON(dir.appendingPathComponent("metadata.json")),
               case .string(let origin) = m.first(where: { $0.key == "origin" })?.value ?? .null
@@ -307,11 +307,11 @@ final class FixtureConformanceTests: XCTestCase {
         }
     }
 
-    // MARK: - C5: full real-chrome-android response open + validate
+    // MARK: - C5: full android-chrome-capture response open + validate
 
-    func testC5_real_chrome_android_response_full_open() throws {
-        let reqDir = Self.fixture("dcapi-requests/real-chrome-android-smart-checkin")
-        let respDir = Self.fixture("responses/real-chrome-android-smart-checkin")
+    func testC5_android_chrome_capture_response_full_open() throws {
+        let reqDir = Self.fixture("dcapi-requests/android-chrome-capture")
+        let respDir = Self.fixture("responses/android-chrome-capture")
         try requireFixture(reqDir.appendingPathComponent("request.json"))
         try requireFixture(respDir.appendingPathComponent("dcapi-response.cbor"))
 

@@ -10,8 +10,7 @@ jobs:
     container: swift:6.1
     steps:
       - uses: actions/checkout@v4
-      - run: scripts/fetch-fixtures.sh
-      - run: scripts/fetch-conformance.sh
+      - run: scripts/fetch-spec.sh
       - run: swift test
       # wallet-response conformance cases: swift test wrote the credentials this
       # wallet built; the spec's reference verifier (the JS client) checks them.

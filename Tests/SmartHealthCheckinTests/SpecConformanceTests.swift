@@ -8,7 +8,7 @@ import Crypto
 
 // The spec's conformance cases (github.com/smart-health-checkin/spec,
 // conformance/), fetched at a pinned ref into spec-conformance/ by
-// scripts/fetch-conformance.sh. Every claimed case must pass except those in
+// scripts/fetch-spec.sh. Every claimed case must pass except those in
 // conformance/known-failures.json, which must still fail: a listed case that
 // passes fails this test until it is removed from the list.
 //
@@ -24,7 +24,7 @@ final class SpecConformanceTests: XCTestCase {
     func testSpecConformanceCases() throws {
         let manifestURL = Self.casesRoot.appendingPathComponent("manifest.json")
         guard FileManager.default.fileExists(atPath: manifestURL.path) else {
-            throw XCTSkip("spec-conformance/ missing: run scripts/fetch-conformance.sh")
+            throw XCTSkip("spec-conformance/ missing: run scripts/fetch-spec.sh")
         }
         try FileManager.default.createDirectory(at: Self.walletOut, withIntermediateDirectories: true)
         let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as! [String: Any]

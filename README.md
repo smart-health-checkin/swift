@@ -219,8 +219,7 @@ The library bakes in the spec's load‑bearing details:
 ## Testing
 
 ```sh
-scripts/fetch-fixtures.sh      # the spec's captured fixtures, into the gitignored fixtures/
-scripts/fetch-conformance.sh   # the spec's conformance cases, into spec-conformance/
+scripts/fetch-spec.sh   # the spec's fixtures and conformance cases, into the gitignored fixtures/ and spec-conformance/
 swift test
 ```
 
@@ -230,9 +229,9 @@ must pass them all: `conformance/known-failures.json` lists none. For warning
 cases it also checks the expected warning code is reported. CI then checks the
 credentials this wallet builds with the spec's reference verifier.
 
-`FixtureConformanceTests` reads the spec's fixtures at a pinned tag
-(`SPEC_FIXTURES_REF` in `scripts/fetch-fixtures.sh`, currently `fixtures-v2`).
-Set `SPEC_FIXTURES_DIR=../spec/fixtures` to test against a local spec checkout.
+Both read the spec at a pinned tag (`SPEC_REF` in `scripts/fetch-spec.sh`,
+currently `v1.0.0-draft.1`). Set `SPEC_DIR=../spec` to test against a local
+spec checkout.
 
 Unit tests cover the model layer, CBOR determinism + slice extraction, COSE_Sign1 round‑trip, HPKE seal/open, DeviceRequest + DeviceResponse build/parse with positive and negative cases, and a Verifier ↔ Wallet integration round‑trip. Plus a fixture test that decodes the actual demo's published `DigitalCredentialsRequest` (`sample.json`) and verifies its `readerAuth` COSE_Sign1 against the embedded leaf cert — this is the strongest proof that the library is byte-compatible with the demo wire format.
 
