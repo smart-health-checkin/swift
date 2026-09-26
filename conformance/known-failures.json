@@ -1,5 +1,24 @@
 {
-  "claims": ["request-json", "response-json", "cross-validation", "request-cbor", "transcript", "hpke-open", "mdoc-verify", "wallet-response"],
+  "claims": [
+    "request-json",
+    "response-json",
+    "cross-validation",
+    "request-cbor",
+    "transcript",
+    "hpke-open",
+    "mdoc-verify",
+    "wallet-response"
+  ],
   "notClaimed": {},
-  "knownFailures": {}
+  "knownFailures": {
+    "request-json/empty-fhir-versions": "Request.swift rejects an empty fhirVersions array; the spec allows it",
+    "response-json/wrong-type": "SmartHealthCheckinResponse.parse doesn't check type (only crossValidate does)",
+    "response-json/duplicate-artifact-ids": "Artifact id uniqueness isn't checked",
+    "cross-validation/unknown-media-type": "Validation.swift only warns on an unknown mediaType",
+    "cross-validation/questionnaire-echo-mismatch": "QuestionnaireResponse.questionnaire isn't compared with the requested canonical",
+    "request-cbor/padded-base64url": "Base64URL.decode accepts padding",
+    "hpke-open/padded-base64url": "Base64URL.decode accepts padding",
+    "mdoc-verify/status-not-ok": "DeviceResponseValidator doesn't check DeviceResponse status",
+    "mdoc-verify/unsupported-digest-algorithm": "DeviceResponseValidator doesn't check MSO digestAlgorithm"
+  }
 }
