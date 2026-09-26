@@ -1,0 +1,5 @@
+{
+  "claims": ["request-json", "response-json", "cross-validation", "request-cbor", "transcript", "hpke-open", "mdoc-verify", "wallet-response"],
+  "notClaimed": {},
+  "knownFailures": {}
+}

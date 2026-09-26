@@ -11,4 +11,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: scripts/fetch-fixtures.sh
+      - run: scripts/fetch-conformance.sh
       - run: swift test
+      # wallet-response conformance cases: swift test wrote the credentials this
+      # wallet built; the spec's reference verifier (the JS client) checks them.
+      - run: apt-get update -qq && apt-get install -y -qq unzip curl >/dev/null
+      - uses: oven-sh/setup-bun@v2
+      - name: Check wallet output with the reference verifier
+        run: |
+          cd spec-conformance
+          bun add --silent https://github.com/smart-health-checkin/client/releases/download/v0.2.2/smart-health-checkin-client-0.2.2.tgz
+          cd ..
+          bun spec-conformance/reference/verify-wallet-output.ts .build/conformance-wallet conformance/known-failures.json
