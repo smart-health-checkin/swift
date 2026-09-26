@@ -265,6 +265,9 @@ public struct CheckinDeviceResponse: Sendable {
     public var version: String
     public var documents: [Document]
     public var status: UInt64
+    /// Structural problems the parser stepped over, such as a document it
+    /// couldn't read ([RCV-1]).
+    public var warnings: [CheckinWarning] = []
 
     public struct Document: Sendable {
         public var docType: String
@@ -278,7 +281,8 @@ public struct CheckinDeviceResponse: Sendable {
     public struct IssuerSigned: Sendable {
         /// namespace -> [(IssuerSignedItem, exact tag-24 bytes from source)]
         public var nameSpaces: [(namespace: String, items: [Item])]
-        public var issuerAuth: COSESign1
+        /// nil when absent or not a COSE_Sign1 (a receiver warns, [VRS-5]).
+        public var issuerAuth: COSESign1?
 
         public struct Item: Sendable {
             public var item: IssuerSignedItem
@@ -290,7 +294,7 @@ public struct CheckinDeviceResponse: Sendable {
             }
         }
 
-        public init(nameSpaces: [(namespace: String, items: [Item])], issuerAuth: COSESign1) {
+        public init(nameSpaces: [(namespace: String, items: [Item])], issuerAuth: COSESign1?) {
             self.nameSpaces = nameSpaces; self.issuerAuth = issuerAuth
         }
     }
@@ -300,9 +304,10 @@ public struct CheckinDeviceResponse: Sendable {
         public var nameSpaces: CBOR
         /// Exact tag-24 byte slice for `nameSpaces` as received.
         public var nameSpacesTag24Bytes: Data
-        public var deviceSignature: COSESign1
+        /// nil when absent or not a COSE_Sign1 (a receiver warns, [VRS-7]).
+        public var deviceSignature: COSESign1?
 
-        public init(nameSpaces: CBOR, nameSpacesTag24Bytes: Data, deviceSignature: COSESign1) {
+        public init(nameSpaces: CBOR, nameSpacesTag24Bytes: Data, deviceSignature: COSESign1?) {
             self.nameSpaces = nameSpaces
             self.nameSpacesTag24Bytes = nameSpacesTag24Bytes
             self.deviceSignature = deviceSignature
@@ -327,6 +332,8 @@ public enum DeviceResponseError: Error, Equatable, Sendable {
     case mdocVersionMismatch
     case msoDocTypeMismatch(expected: String, actual: String)
     case validityInfoOutOfRange
+    /// The response element's value is not a text string ([VRS-8]).
+    case elementNotText
 }
 
 // MARK: - Builder
@@ -355,8 +362,9 @@ public enum DeviceResponseBuilder {
     ///   - deviceKey: ES256 private key that signs `DeviceAuthentication`. Its
     ///     public counterpart is recorded in the MSO's `deviceKey`.
     ///   - sessionTranscript: bytes computed by §8.3.
-    ///   - issuerCertificateChain: optional chain to attach as COSE header
-    ///     label 33 (`x5chain`). The leaf certificate's DER bytes go first.
+    ///   - issuerCertificateChain: chain to attach as COSE header label 33
+    ///     (`x5chain`), leaf first. When empty, a self-signed certificate for
+    ///     `issuerKey` is minted ([WRS-4]).
     public static func build(
         smartResponseJSON: Data,
         issuerKey: P256.Signing.PrivateKey,
@@ -379,7 +387,7 @@ public enum DeviceResponseBuilder {
 
         // 2. Build MSO and sign it as the COSE_Sign1 *attached* payload of
         //    `Tag(24, bstr .cbor MSO)` per the rubber-duck guidance.
-        let now = Date()
+        let now = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
         let validity = validityInfo ?? .init(
             signed: now,
             validFrom: now,
@@ -397,6 +405,14 @@ public enum DeviceResponseBuilder {
         // Attached: payload = tag-24-wrapped MSO bytes.
         let issuerProtected = COSESign1Signer.es256ProtectedHeader()
         var issuerUnprotected: [CBORMapEntry] = []
+        // [WRS-4] x5chain carries the certificate for the issuer key. With none
+        // supplied, the Wallet self-signs one for this key (§7 allows it).
+        var issuerCertificateChain = issuerCertificateChain
+        if issuerCertificateChain.isEmpty {
+            issuerCertificateChain = [try X509Helper.selfSignedCertificate(
+                for: issuerKey, commonName: "SMART Health Check-in Wallet",
+                notBefore: validity.validFrom, notAfter: validity.validUntil)]
+        }
         if !issuerCertificateChain.isEmpty {
             // COSE header label 33 (x5chain): single bstr if one cert, otherwise
             // an array of bstrs.
@@ -475,12 +491,17 @@ public enum DeviceResponseBuilder {
 // MARK: - Parser
 
 public enum DeviceResponseParser {
+    /// Decode a DeviceResponse as a Verifier receives it. Fails only if the
+    /// bytes aren't a CBOR map. Documents, items, and COSE structures that
+    /// can't be read are skipped or left nil and noted in `warnings`; the
+    /// validator decides what's fatal ([VRS-4]..[VRS-8]).
     public static func parse(_ data: Data) throws -> CheckinDeviceResponse {
         let decoded = try CBORDecoder.lenient.decodeWithSlices(data)
         guard case .map(let entries) = decoded.value else { throw DeviceResponseError.malformed }
-        var version: String?
+        var version = ""
         var documentsRaw: [CBOR] = []
         var status: UInt64 = 0
+        var warnings: [CheckinWarning] = []
         for e in entries {
             guard case .textString(let k) = e.key else { continue }
             switch k {
@@ -490,104 +511,85 @@ public enum DeviceResponseParser {
             default: break
             }
         }
-        guard let version = version else { throw DeviceResponseError.malformed }
 
         var docs: [CheckinDeviceResponse.Document] = []
         for (di, doc) in documentsRaw.enumerated() {
-            guard case .map(let docEntries) = doc else { throw DeviceResponseError.malformed }
-            var docType: String?
-            var issuerSigned: CBOR?, deviceSigned: CBOR?
-            for e in docEntries {
-                guard case .textString(let k) = e.key else { continue }
-                switch k {
-                case "docType":      if case .textString(let s) = e.value { docType = s }
-                case "issuerSigned": issuerSigned = e.value
-                case "deviceSigned": deviceSigned = e.value
-                default: break
-                }
+            do {
+                docs.append(try parseDocument(doc, at: di, in: decoded))
+            } catch {
+                warnings.append(.init("documents", "skipped document \(di): \(error)"))
             }
-            guard let docType = docType, let issuerSigned = issuerSigned, let deviceSigned = deviceSigned else {
-                throw DeviceResponseError.malformed
+        }
+        var out = CheckinDeviceResponse(version: version, documents: docs, status: status)
+        out.warnings = warnings
+        return out
+    }
+
+    static func parseDocument(_ doc: CBOR, at di: Int, in decoded: CBORDecoder.DecodedCBOR) throws -> CheckinDeviceResponse.Document {
+        guard case .map(let docEntries) = doc else { throw DeviceResponseError.malformed }
+        var docType: String?
+        var issuerSigned: CBOR?, deviceSigned: CBOR?
+        for e in docEntries {
+            guard case .textString(let k) = e.key else { continue }
+            switch k {
+            case "docType":      if case .textString(let s) = e.value { docType = s }
+            case "issuerSigned": issuerSigned = e.value
+            case "deviceSigned": deviceSigned = e.value
+            default: break
             }
-            // IssuerSigned
-            guard case .map(let isEntries) = issuerSigned else { throw DeviceResponseError.malformed }
-            var issuerAuth: COSESign1?
-            var nameSpaces: [(namespace: String, items: [CheckinDeviceResponse.IssuerSigned.Item])] = []
-            for (ei, e) in isEntries.enumerated() {
-                guard case .textString(let k) = e.key else { continue }
-                if k == "issuerAuth" {
-                    issuerAuth = try COSESign1.from(e.value)
-                } else if k == "nameSpaces" {
-                    guard case .map(let nsEntries) = e.value else { throw DeviceResponseError.malformed }
-                    for (ni, ne) in nsEntries.enumerated() {
-                        guard case .textString(let nsName) = ne.key,
-                              case .array(let arr) = ne.value else { throw DeviceResponseError.malformed }
-                        var items: [CheckinDeviceResponse.IssuerSigned.Item] = []
-                        for (ii, av) in arr.enumerated() {
-                            guard case let .tagged(24, .byteString(inner)) = av else {
-                                throw DeviceResponseError.malformed
-                            }
-                            // Pull the EXACT outer tag-24 byte slice from the source.
-                            let path: [CBORDecoder.DecodedCBOR.PathStep] = [
-                                .key(.textString("documents")),
-                                .index(di),
-                                .key(.textString("issuerSigned")),
-                                .key(.textString("nameSpaces")),
-                                .key(.textString(nsName)),
-                                .index(ii),
-                            ]
-                            let slice = try decoded.slice(at: path).source
-                            let inner_ = try CBORDecoder.lenient.decode(inner)
-                            let item = try IssuerSignedItem.fromCBOR(inner_)
-                            items.append(.init(item: item, tag24Bytes: slice))
-                        }
-                        nameSpaces.append((nsName, items))
-                        _ = (ei, ni) // suppress unused warnings
+        }
+        guard let docType = docType, case .map(let isEntries)? = issuerSigned else { throw DeviceResponseError.malformed }
+        var issuerAuth: COSESign1?
+        var nameSpaces: [(namespace: String, items: [CheckinDeviceResponse.IssuerSigned.Item])] = []
+        for e in isEntries {
+            guard case .textString(let k) = e.key else { continue }
+            if k == "issuerAuth" {
+                issuerAuth = try? COSESign1.from(e.value)
+            } else if k == "nameSpaces", case .map(let nsEntries) = e.value {
+                for ne in nsEntries {
+                    guard case .textString(let nsName) = ne.key, case .array(let arr) = ne.value else { continue }
+                    var items: [CheckinDeviceResponse.IssuerSigned.Item] = []
+                    for (ii, av) in arr.enumerated() {
+                        guard case let .tagged(24, .byteString(inner)) = av,
+                              let innerValue = try? CBORDecoder.lenient.decode(inner),
+                              let item = try? IssuerSignedItem.fromCBOR(innerValue) else { continue }
+                        // The EXACT outer tag-24 byte slice from the source, for the digest ([ENC-2]).
+                        let slice = try decoded.slice(at: [
+                            .key(.textString("documents")), .index(di),
+                            .key(.textString("issuerSigned")), .key(.textString("nameSpaces")),
+                            .key(.textString(nsName)), .index(ii),
+                        ]).source
+                        items.append(.init(item: item, tag24Bytes: slice))
                     }
+                    nameSpaces.append((nsName, items))
                 }
             }
-            guard let issuerAuth = issuerAuth else { throw DeviceResponseError.malformed }
-            // DeviceSigned
-            guard case .map(let dsEntries) = deviceSigned else { throw DeviceResponseError.malformed }
-            var deviceNameSpaces: CBOR?
-            var deviceAuth: CBOR?
+        }
+        // DeviceSigned: any problem here only affects the device signature check.
+        var dnsValue: CBOR = .map([])
+        var dnsTag24Bytes = Data()
+        var deviceSig: COSESign1?
+        if case .map(let dsEntries)? = deviceSigned {
             for e in dsEntries {
                 guard case .textString(let k) = e.key else { continue }
-                if k == "nameSpaces" { deviceNameSpaces = e.value }
-                if k == "deviceAuth" { deviceAuth = e.value }
+                if k == "nameSpaces", case let .tagged(24, .byteString(inner)) = e.value {
+                    dnsValue = (try? CBORDecoder.lenient.decode(inner)) ?? .map([])
+                    dnsTag24Bytes = (try? decoded.slice(at: [
+                        .key(.textString("documents")), .index(di),
+                        .key(.textString("deviceSigned")), .key(.textString("nameSpaces")),
+                    ]).source) ?? Data()
+                }
+                if k == "deviceAuth", case .map(let daEntries) = e.value,
+                   let sig = daEntries.first(where: { if case .textString("deviceSignature") = $0.key { return true } else { return false } }) {
+                    deviceSig = try? COSESign1.from(sig.value)
+                }
             }
-            guard let deviceNameSpacesVal = deviceNameSpaces,
-                  case let .tagged(24, .byteString(inner)) = deviceNameSpacesVal,
-                  let deviceAuth = deviceAuth else {
-                throw DeviceResponseError.malformed
-            }
-            let dnsTag24Bytes = try decoded.slice(at: [
-                .key(.textString("documents")),
-                .index(di),
-                .key(.textString("deviceSigned")),
-                .key(.textString("nameSpaces"))
-            ]).source
-            let decodedDNs = try CBORDecoder.lenient.decode(inner)
-            // Extract deviceSignature
-            guard case .map(let daEntries) = deviceAuth,
-                  let dsigEntry = daEntries.first(where: { e in
-                      if case .textString(let s) = e.key { return s == "deviceSignature" } else { return false }
-                  }) else {
-                throw DeviceResponseError.malformed
-            }
-            let deviceSig = try COSESign1.from(dsigEntry.value)
-
-            docs.append(.init(
-                docType: docType,
-                issuerSigned: .init(nameSpaces: nameSpaces, issuerAuth: issuerAuth),
-                deviceSigned: .init(
-                    nameSpaces: decodedDNs,
-                    nameSpacesTag24Bytes: dnsTag24Bytes,
-                    deviceSignature: deviceSig
-                )
-            ))
         }
-        return CheckinDeviceResponse(version: version, documents: docs, status: status)
+        return .init(
+            docType: docType,
+            issuerSigned: .init(nameSpaces: nameSpaces, issuerAuth: issuerAuth),
+            deviceSigned: .init(nameSpaces: dnsValue, nameSpacesTag24Bytes: dnsTag24Bytes, deviceSignature: deviceSig)
+        )
     }
 }
 
@@ -599,8 +601,12 @@ public struct CheckinDeviceResponseValidation: Sendable {
     public var issuerSignatureValid: Bool
     public var deviceSignatureValid: Bool
     public var digestMatch: Bool
-    public var validityInfo: MobileSecurityObject.ValidityInfo
+    /// nil when the MSO has no readable validityInfo (a warning).
+    public var validityInfo: MobileSecurityObject.ValidityInfo?
     public var issuerCertificateChain: [Data]
+    /// Everything that failed but doesn't stop the Verifier ([RCV-1]). Empty
+    /// when every signature, digest, and MSO field checks out.
+    public var warnings: [CheckinWarning]
 }
 
 public enum DeviceResponseValidator {
@@ -610,133 +616,189 @@ public enum DeviceResponseValidator {
         public var namespace: String
         public var element: String
         /// Optional issuer trust check. If nil, the issuer signature is checked
-        /// only against the key embedded in the message's COSE headers (i.e.
-        /// the leaf cert's subjectPublicKey from x5chain). Production
-        /// deployments should provide an explicit trusted key.
+        /// against the leaf certificate in `x5chain` (§7: signatures show the
+        /// mdoc is intact and well formed, not who issued it).
         public var trustedIssuerKeys: [P256.Signing.PublicKey]?
+        /// The time to check the MSO validity window against ([VRS-10]).
+        public var now: Date
+        /// Clock difference tolerated around the validity window.
+        public var clockSkew: TimeInterval
         public init(docType: String, namespace: String, element: String,
-                    trustedIssuerKeys: [P256.Signing.PublicKey]? = nil) {
+                    trustedIssuerKeys: [P256.Signing.PublicKey]? = nil,
+                    now: Date = Date(), clockSkew: TimeInterval = 300) {
             self.docType = docType; self.namespace = namespace; self.element = element
             self.trustedIssuerKeys = trustedIssuerKeys
+            self.now = now; self.clockSkew = clockSkew
         }
     }
 
-    /// Validate an mdoc DeviceResponse against the given verifier expectations
-    /// and a SessionTranscript. Returns a structured report with separate
-    /// signals for each layer; the caller chooses how to combine them.
+    /// Validate a DeviceResponse as a Verifier (§8.5). Throws only where §8.5
+    /// says **fail**: no document with `options.docType` ([VRS-4]), or no
+    /// response element with a text value ([VRS-8]). Every other problem —
+    /// signatures, digests, MSO fields, validity, versions, status — is
+    /// reported in `warnings` and the boolean fields ([VRS-4]..[VRS-7], [VRS-10]).
     public static func validate(
         _ response: CheckinDeviceResponse,
         sessionTranscript: Data,
         options: Options
     ) throws -> CheckinDeviceResponseValidation {
-        if response.version != "1.0" { throw DeviceResponseError.unsupportedVersion(response.version) }
-        guard let doc = response.documents.first(where: { $0.docType == options.docType }) else {
+        var warnings = response.warnings
+        if response.version != "1.0" {
+            warnings.append(.init("device-response-version", "DeviceResponse version is \"\(response.version)\", not \"1.0\""))
+        }
+        if response.status != 0 {
+            warnings.append(.init("device-response-status", "DeviceResponse status is \(response.status), not 0"))
+        }
+        let matching = response.documents.filter { $0.docType == options.docType }
+        guard let doc = matching.first else {
             throw DeviceResponseError.unexpectedDocType(response.documents.first?.docType ?? "<none>")
         }
-
-        // Verify issuer signature: the COSE_Sign1 payload is `Tag(24, bstr .cbor MSO)`.
-        var issuerSignatureValid = false
-        // Pull issuer cert chain (label 33) from headers if present.
-        var issuerCertificateChain: [Data] = []
-        for e in doc.issuerSigned.issuerAuth.unprotected {
-            if case .negative(let n) = e.key, -1 - Int64(n) == 33 {
-                issuerCertificateChain = extractCertChain(e.value)
-            } else if case .unsigned(let n) = e.key, Int64(n) == 33 {
-                issuerCertificateChain = extractCertChain(e.value)
-            }
+        if response.documents.count > 1 {
+            warnings.append(.init("documents", "\(response.documents.count) documents in the DeviceResponse; using the first \(options.docType)"))
         }
-        // Decide which key(s) to verify against.
-        var candidateKeys: [P256.Signing.PublicKey] = options.trustedIssuerKeys ?? []
-        if candidateKeys.isEmpty {
-            // No trusted keys provided: best-effort accept embedded leaf cert key.
-            if let leaf = issuerCertificateChain.first,
-               let key = leafSubjectPublicKey(leaf) {
+
+        // [VRS-8] The response element must be present with a text value.
+        guard let smartItem = doc.issuerSigned.nameSpaces
+            .first(where: { $0.namespace == options.namespace })?
+            .items.first(where: { $0.item.elementIdentifier == options.element }) else {
+            throw DeviceResponseError.missingItem(namespace: options.namespace, element: options.element)
+        }
+        guard case .textString(let smartJSON) = smartItem.item.elementValue else {
+            throw DeviceResponseError.elementNotText
+        }
+
+        // [VRS-5] issuerAuth.
+        var issuerSignatureValid = false
+        var issuerCertificateChain: [Data] = []
+        var msoMap: [CBORMapEntry]?
+        if let issuerAuth = doc.issuerSigned.issuerAuth {
+            for e in issuerAuth.unprotected {
+                if case .unsigned(33) = e.key { issuerCertificateChain = extractCertChain(e.value) }
+            }
+            var candidateKeys: [P256.Signing.PublicKey] = options.trustedIssuerKeys ?? []
+            if candidateKeys.isEmpty, let leaf = issuerCertificateChain.first, let key = leafSubjectPublicKey(leaf) {
                 candidateKeys.append(key)
             }
-        }
-        for k in candidateKeys {
-            do {
-                try COSESign1Signer.verify(doc.issuerSigned.issuerAuth, publicKey: k)
-                issuerSignatureValid = true
-                break
-            } catch { /* try next key */ }
-        }
-
-        // Parse the MSO.
-        guard let payload = doc.issuerSigned.issuerAuth.payload else {
-            throw DeviceResponseError.malformed
-        }
-        // payload should be `Tag(24, bstr .cbor MSO)`.
-        let payloadCBOR = try CBORDecoder.lenient.decode(payload)
-        let msoBytes: Data
-        if case let .tagged(24, .byteString(inner)) = payloadCBOR {
-            msoBytes = inner
-        } else if case .map = payloadCBOR {
-            // Some legacy implementations sign the bare MSO map. Accept and warn.
-            msoBytes = payload
+            if candidateKeys.isEmpty {
+                warnings.append(.init("issuer-signature", "no issuer key: x5chain is missing or unreadable"))
+            } else if let algWarning = algWarning(issuerAuth.protectedBytes, "issuerAuth") {
+                warnings.append(algWarning)
+                warnings.append(.init("issuer-signature", "issuerAuth not verified: unsupported algorithm"))
+            } else {
+                for k in candidateKeys where (try? COSESign1Signer.verify(issuerAuth, publicKey: k)) != nil {
+                    issuerSignatureValid = true; break
+                }
+                if !issuerSignatureValid { warnings.append(.init("issuer-signature", "issuerAuth signature does not verify")) }
+            }
+            if let payload = issuerAuth.payload, let p = try? CBORDecoder.lenient.decode(payload) {
+                var msoValue: CBOR? = nil
+                if case let .tagged(24, .byteString(inner)) = p { msoValue = try? CBORDecoder.lenient.decode(inner) }
+                else if case .map = p { msoValue = p }
+                if case .map(let m)? = msoValue { msoMap = m }
+            }
         } else {
-            throw DeviceResponseError.malformedMSO
-        }
-        let msoCBOR = try CBORDecoder.lenient.decode(msoBytes)
-        let mso = try MobileSecurityObject.fromCBOR(msoCBOR)
-        if mso.docType != options.docType {
-            throw DeviceResponseError.msoDocTypeMismatch(expected: options.docType, actual: mso.docType)
+            warnings.append(.init("issuer-signature", "issuerAuth is missing or not a COSE_Sign1"))
         }
 
-        // Find the IssuerSignedItem for the expected namespace + element and
-        // verify its tag-24 wrapper bytes hash to the MSO digest.
-        guard let ns = doc.issuerSigned.nameSpaces.first(where: { $0.namespace == options.namespace }) else {
-            throw DeviceResponseError.missingItem(namespace: options.namespace, element: options.element)
+        // MSO fields, read one by one so each problem is its own warning.
+        func field(_ name: String) -> CBOR? {
+            msoMap?.first(where: { if case .textString(name) = $0.key { return true } else { return false } })?.value
         }
-        guard let smartItem = ns.items.first(where: { $0.item.elementIdentifier == options.element }) else {
-            throw DeviceResponseError.missingItem(namespace: options.namespace, element: options.element)
+        var validityInfo: MobileSecurityObject.ValidityInfo?
+        var digestMatch = false
+        var deviceKey: P256.Signing.PublicKey?
+        if msoMap == nil {
+            warnings.append(.init("mso", "issuerAuth carries no readable MobileSecurityObject"))
+        } else {
+            if case .textString(let v)? = field("version"), v == "1.0" {} else {
+                warnings.append(.init("mso-version", "MSO version is not \"1.0\""))
+            }
+            if case .textString(let dt)? = field("docType"), dt == doc.docType {} else {
+                warnings.append(.init("mso-doc-type", "MSO docType doesn't match the document's"))
+            }
+            // [VRS-10] validity window.
+            if let vi = parseValidityInfo(field("validityInfo")) {
+                validityInfo = vi
+                if options.now < vi.validFrom.addingTimeInterval(-options.clockSkew)
+                    || options.now > vi.validUntil.addingTimeInterval(options.clockSkew) {
+                    warnings.append(.init("mso-validity", "the MSO is not valid at \(MobileSecurityObject.iso8601(options.now))"))
+                }
+            } else {
+                warnings.append(.init("mso-validity-info", "MSO has no readable validityInfo"))
+            }
+            // [VRS-6] value digest.
+            if case .textString(let alg)? = field("digestAlgorithm"), alg == "SHA-256" {
+                var expected: Data?
+                if case .map(let nsEntries)? = field("valueDigests"),
+                   case .map(let dEntries)? = nsEntries.first(where: { if case .textString(options.namespace) = $0.key { return true } else { return false } })?.value,
+                   case .byteString(let d)? = dEntries.first(where: { if case .unsigned(smartItem.item.digestID) = $0.key { return true } else { return false } })?.value {
+                    expected = d
+                }
+                if let expected = expected {
+                    digestMatch = Data(SHA256.hash(data: smartItem.tag24Bytes)) == expected
+                    if !digestMatch { warnings.append(.init("digest", "the response element's digest doesn't match the MSO")) }
+                } else {
+                    warnings.append(.init("digest", "the MSO has no digest for digestID \(smartItem.item.digestID)"))
+                }
+            } else {
+                warnings.append(.init("digest-algorithm", "MSO digestAlgorithm is not SHA-256; digest not checked"))
+            }
+            if case .map(let dki)? = field("deviceKeyInfo"),
+               let dk = dki.first(where: { if case .textString("deviceKey") = $0.key { return true } else { return false } })?.value {
+                deviceKey = try? COSEKey.decodeP256(dk).asSigningKey()
+            }
         }
-        // Find the digest entry in the MSO.
-        guard let digestNs = mso.valueDigests.first(where: { $0.namespace == options.namespace }) else {
-            throw DeviceResponseError.missingDigestEntry
-        }
-        guard let digestEntry = digestNs.digests.first(where: { $0.id == smartItem.item.digestID }) else {
-            throw DeviceResponseError.missingDigestEntry
-        }
-        let computed = Data(SHA256.hash(data: smartItem.tag24Bytes))
-        let digestMatch = computed == digestEntry.digest
 
-        // Verify deviceSignature by reconstructing DeviceAuthentication using
-        // the EXACT received deviceSigned.nameSpaces tag-24 bytes.
-        let devAuthBytes = DeviceAuthentication.bytes(
-            sessionTranscript: sessionTranscript,
-            docType: options.docType,
-            deviceNamespacesTag24Bytes: doc.deviceSigned.nameSpacesTag24Bytes
-        )
+        // [VRS-7] device signature over the rebuilt DeviceAuthenticationBytes.
         var deviceSignatureValid = false
-        do {
-            let deviceKey = try COSEKey.decodeP256(mso.deviceKey).asSigningKey()
-            // Always verify against the reconstructed DeviceAuthentication
-            // bytes. If the wire form has an attached payload, the COSE
-            // verifier additionally enforces attached == reconstructed.
-            try COSESign1Signer.verify(
-                doc.deviceSigned.deviceSignature,
-                publicKey: deviceKey,
-                detachedPayload: devAuthBytes
+        if let sig = doc.deviceSigned.deviceSignature, let key = deviceKey {
+            let devAuthBytes = DeviceAuthentication.bytes(
+                sessionTranscript: sessionTranscript,
+                docType: options.docType,
+                deviceNamespacesTag24Bytes: doc.deviceSigned.nameSpacesTag24Bytes
             )
-            deviceSignatureValid = true
-        } catch {
-            deviceSignatureValid = false
+            if let algWarning = algWarning(sig.protectedBytes, "deviceSignature") {
+                warnings.append(algWarning)
+            } else if let attached = sig.payload, attached != devAuthBytes {
+                // An attached payload must equal the rebuilt bytes.
+            } else {
+                deviceSignatureValid = (try? COSESign1Signer.verify(sig, publicKey: key, detachedPayload: devAuthBytes)) != nil
+            }
+            if !deviceSignatureValid {
+                warnings.append(.init("device-signature", "the device signature does not verify over this session's DeviceAuthentication"))
+            }
+        } else {
+            warnings.append(.init("device-signature", doc.deviceSigned.deviceSignature == nil
+                ? "deviceSignature is missing or not a COSE_Sign1" : "the MSO has no usable deviceKey"))
         }
 
-        // Extract the SMART response JSON.
-        guard case .textString(let smartJSON) = smartItem.item.elementValue else {
-            throw DeviceResponseError.malformed
-        }
         return .init(
             docType: doc.docType,
             smartResponseJSON: Data(smartJSON.utf8),
             issuerSignatureValid: issuerSignatureValid,
             deviceSignatureValid: deviceSignatureValid,
             digestMatch: digestMatch,
-            validityInfo: mso.validityInfo,
-            issuerCertificateChain: issuerCertificateChain
+            validityInfo: validityInfo,
+            issuerCertificateChain: issuerCertificateChain,
+            warnings: warnings
         )
+    }
+
+    /// An `alg` warning when a protected header doesn't say ES256 ([ALG-2]).
+    static func algWarning(_ protectedBytes: Data, _ what: String) -> CheckinWarning? {
+        do { try COSESign1Signer.requireES256(in: protectedBytes); return nil }
+        catch { return .init("alg", "\(what) doesn't use ES256 (\(error))") }
+    }
+
+    static func parseValidityInfo(_ v: CBOR?) -> MobileSecurityObject.ValidityInfo? {
+        guard case .map(let entries)? = v else { return nil }
+        func date(_ name: String) -> Date? {
+            guard let e = entries.first(where: { if case .textString(name) = $0.key { return true } else { return false } }),
+                  case .tagged(0, .textString(let s)) = e.value else { return nil }
+            return iso8601Parse(s)
+        }
+        guard let signed = date("signed"), let from = date("validFrom"), let until = date("validUntil") else { return nil }
+        return .init(signed: signed, validFrom: from, validUntil: until)
     }
 
     static func extractCertChain(_ v: CBOR) -> [Data] {
@@ -747,9 +809,7 @@ public enum DeviceResponseValidator {
         }
     }
 
-    /// Extract the SubjectPublicKeyInfo's P-256 public key from a DER-encoded
-    /// X.509 certificate. Uses CryptoKit's certificate parsing if available.
     static func leafSubjectPublicKey(_ certDER: Data) -> P256.Signing.PublicKey? {
-        return X509Helper.p256PublicKey(fromCertificate: certDER)
+        X509Helper.p256PublicKey(fromCertificate: certDER)
     }
 }

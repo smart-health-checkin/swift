@@ -91,11 +91,16 @@ public struct CheckinItemsRequest: Sendable, Equatable {
 
 public struct CheckinDeviceRequest: Sendable, Equatable {
     public var version: String
+    /// The DocRequests for this profile's docType, in order. DocRequests for
+    /// other docTypes are ignored ([WRQ-4]).
     public var docRequests: [CheckinDocRequest]
+    /// Problems found while parsing that don't stop the Wallet ([RCV-1]).
+    public var warnings: [CheckinWarning]
 
-    public init(version: String = "1.0", docRequests: [CheckinDocRequest]) {
+    public init(version: String = "1.0", docRequests: [CheckinDocRequest], warnings: [CheckinWarning] = []) {
         self.version = version
         self.docRequests = docRequests
+        self.warnings = warnings
     }
 }
 
@@ -170,23 +175,26 @@ public enum DeviceRequestBuilder {
 public enum DeviceRequestParser {
     public enum Error: Swift.Error, Equatable, Sendable {
         case malformedDeviceRequest
-        case unsupportedDeviceRequestVersion(String)
         case malformedDocRequest
         case malformedItemsRequest
-        case missingItemsRequestField(String)
+        /// No DocRequest asks for this profile's docType ([WRQ-4]).
+        case noMatchingDocRequest(expected: String)
+        /// No SMART request text under `requestInfo` ([WRQ-5]).
+        case missingRequestInfo
         case nonTextRequestCarrier
-        case docTypeMismatch(expected: String, actual: String)
-        case namespaceMismatch(expected: String)
-        case elementMismatch(expected: String)
     }
 
-    /// Parse a DeviceRequest's CBOR bytes. Validates structure but does NOT
-    /// validate any embedded SMART JSON (do that at the next layer).
+    /// Parse a DeviceRequest as a Wallet receives it (§8.4). Fails only where
+    /// §8.4 says **fail**: the bytes don't decode, no DocRequest asks for
+    /// `options.docType` ([WRQ-4]), or its ItemsRequest can't be decoded or has
+    /// no request text ([WRQ-5]). Everything else is a warning in the result.
+    /// Doesn't validate the SMART JSON itself.
     public static func parse(_ data: Data, expecting options: DeviceRequestBuilder.Options) throws -> CheckinDeviceRequest {
         let decoded = try CBORDecoder.lenient.decodeWithSlices(data)
         guard case .map(let entries) = decoded.value else { throw Error.malformedDeviceRequest }
+        var warnings: [CheckinWarning] = []
         var version: String?
-        var docRequestsRaw: [CBOR]?
+        var docRequestsRaw: [CBOR] = []
         for e in entries {
             guard case .textString(let key) = e.key else { continue }
             switch key {
@@ -197,18 +205,13 @@ public enum DeviceRequestParser {
             default: break
             }
         }
-        guard let version = version else { throw Error.malformedDeviceRequest }
-        guard version == "1.0" else { throw Error.unsupportedDeviceRequestVersion(version) }
-        guard let docRequestsRaw = docRequestsRaw, !docRequestsRaw.isEmpty else {
-            throw Error.malformedDeviceRequest
+        if version != "1.0" {
+            warnings.append(.init("device-request-version", "DeviceRequest version is \(version.map { "\"\($0)\"" } ?? "missing"), not \"1.0\" ([WRQ-3])"))
         }
 
-        // Find each docRequests[i].itemsRequest tag-24 wrapper; we need its
-        // exact bytes to compute readerAuth's detached payload (and to keep
-        // the verifier's commitment to those bytes if it later signs them).
         var docs: [CheckinDocRequest] = []
         for (i, dr) in docRequestsRaw.enumerated() {
-            guard case .map(let drEntries) = dr else { throw Error.malformedDocRequest }
+            guard case .map(let drEntries) = dr else { continue }
             var itemsTag24: CBOR?
             var readerAuthVal: CBOR?
             for e in drEntries {
@@ -220,81 +223,90 @@ public enum DeviceRequestParser {
                 }
             }
             guard let itemsTag24 = itemsTag24,
-                  case let .tagged(24, .byteString(itemsBytes)) = itemsTag24 else {
-                throw Error.malformedDocRequest
-            }
-            let itemsRequest = try parseItemsRequest(itemsBytes, expecting: options)
-            // The exact tag-24 wrapper bytes from the source — used by the
-            // wallet/verifier when validating readerAuth.
+                  case let .tagged(24, .byteString(itemsBytes)) = itemsTag24,
+                  let itemsValue = try? CBORDecoder.lenient.decode(itemsBytes),
+                  case .map(let itemsEntries) = itemsValue else { continue }
+            // Only this profile's docType matters; others are ignored ([WRQ-4]).
+            let docType = itemsEntries.first { if case .textString("docType") = $0.key { return true } else { return false } }?.value
+            guard case .textString(options.docType)? = docType else { continue }
+
+            let itemsRequest = try parseItemsRequest(itemsEntries, expecting: options, warnings: &warnings)
+            // The exact tag-24 wrapper bytes from the source, for readerAuth.
             let tag24SrcSlice = try decoded.slice(at: [
                 .key(.textString("docRequests")),
                 .index(i),
                 .key(.textString("itemsRequest")),
             ]).source
-
-            let readerAuth: COSESign1? = try readerAuthVal.map { try COSESign1.from($0) }
+            var readerAuth: COSESign1?
+            if let raw = readerAuthVal {
+                do { readerAuth = try COSESign1.from(raw) }
+                catch { warnings.append(.init("reader-auth", "readerAuth is not a COSE_Sign1; ignored")) }
+            }
             docs.append(.init(itemsRequestTag24Bytes: tag24SrcSlice, itemsRequest: itemsRequest, readerAuth: readerAuth))
         }
-        return CheckinDeviceRequest(version: version, docRequests: docs)
+        guard !docs.isEmpty else { throw Error.noMatchingDocRequest(expected: options.docType) }
+        if docs.count > 1 {
+            warnings.append(.init("doc-requests", "\(docs.count) DocRequests ask for \(options.docType); using the first ([WRQ-4])"))
+        }
+        return CheckinDeviceRequest(version: version ?? "", docRequests: docs, warnings: warnings)
     }
 
-    static func parseItemsRequest(_ data: Data, expecting options: DeviceRequestBuilder.Options) throws -> CheckinItemsRequest {
-        let v = try CBORDecoder.lenient.decode(data)
-        guard case .map(let entries) = v else { throw Error.malformedItemsRequest }
-        var docType: String?
+    static func parseItemsRequest(
+        _ entries: [CBORMapEntry],
+        expecting options: DeviceRequestBuilder.Options,
+        warnings: inout [CheckinWarning]
+    ) throws -> CheckinItemsRequest {
         var nameSpaces: CBOR?
         var requestInfoRaw: CBOR?
         for e in entries {
             guard case .textString(let k) = e.key else { continue }
             switch k {
-            case "docType":     if case .textString(let s) = e.value { docType = s }
             case "nameSpaces":  nameSpaces = e.value
             case "requestInfo": requestInfoRaw = e.value
             default: break
             }
         }
-        guard let docType = docType else { throw Error.missingItemsRequestField("docType") }
-        guard docType == options.docType else {
-            throw Error.docTypeMismatch(expected: options.docType, actual: docType)
-        }
-        guard let nameSpaces = nameSpaces else { throw Error.missingItemsRequestField("nameSpaces") }
-        // Build elementsByNamespace ensuring we see the expected SMART namespace+element.
-        guard case .map(let nsEntries) = nameSpaces else { throw Error.malformedItemsRequest }
-        var found = false
+        // [WRQ-5] nameSpaces problems are warnings.
+        var requested = false
         var allNs: [(namespace: String, elements: [(element: String, intentToRetain: Bool)])] = []
-        for e in nsEntries {
-            guard case .textString(let nsName) = e.key else { continue }
-            guard case .map(let elements) = e.value else { throw Error.malformedItemsRequest }
-            var elList: [(element: String, intentToRetain: Bool)] = []
-            for el in elements {
-                guard case .textString(let elName) = el.key else { continue }
-                let retain: Bool
-                if case .bool(let b) = el.value { retain = b } else { throw Error.malformedItemsRequest }
-                elList.append((elName, retain))
-                if nsName == options.namespace && elName == options.element { found = true }
+        if case .map(let nsEntries)? = nameSpaces {
+            for e in nsEntries {
+                guard case .textString(let nsName) = e.key, case .map(let elements) = e.value else { continue }
+                var elList: [(element: String, intentToRetain: Bool)] = []
+                for el in elements {
+                    guard case .textString(let elName) = el.key else { continue }
+                    let retain: Bool
+                    if case .bool(let b) = el.value { retain = b } else {
+                        retain = false
+                        if nsName == options.namespace && elName == options.element {
+                            warnings.append(.init("intent-to-retain", "intentToRetain for \(elName) is not a boolean; treated as false"))
+                        }
+                    }
+                    elList.append((elName, retain))
+                    if nsName == options.namespace && elName == options.element { requested = true }
+                }
+                allNs.append((nsName, elList))
             }
-            allNs.append((nsName, elList))
         }
-        if !found {
-            throw Error.elementMismatch(expected: "\(options.namespace).\(options.element)")
+        if !requested {
+            warnings.append(.init("items-request", "the ItemsRequest doesn't request \(options.namespace).\(options.element)"))
         }
 
+        // [WRQ-5] The SMART request text is required.
         var requestInfo: [(key: String, value: CBOR)] = []
-        if let requestInfoRaw = requestInfoRaw {
-            guard case .map(let riEntries) = requestInfoRaw else { throw Error.malformedItemsRequest }
+        var found = false
+        if case .map(let riEntries)? = requestInfoRaw {
             for e in riEntries {
                 guard case .textString(let k) = e.key else { continue }
-                if k == options.requestCarrierKey, case .textString = e.value {
-                    requestInfo.append((k, e.value))
-                } else if k == options.requestCarrierKey {
-                    // §8.4: the SMART request carrier MUST be a CBOR text string.
-                    throw Error.nonTextRequestCarrier
-                } else {
-                    requestInfo.append((k, e.value))
+                if k == options.requestCarrierKey {
+                    guard case .textString = e.value else { throw Error.nonTextRequestCarrier }
+                    found = true
                 }
+                requestInfo.append((k, e.value))
             }
         }
-        return CheckinItemsRequest(docType: docType, elementsByNamespace: allNs, requestInfo: requestInfo)
+        guard found else { throw Error.missingRequestInfo }
+        return CheckinItemsRequest(docType: options.docType, elementsByNamespace: allNs, requestInfo: requestInfo)
     }
 }
 

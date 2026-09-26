@@ -18,7 +18,7 @@ The package exposes both **Verifier** (clinic / kiosk) and **Wallet** (patient a
 ## Install
 
 ```swift
-.package(url: "https://github.com/smart-health-checkin/swift.git", from: "0.1.0")
+.package(url: "https://github.com/smart-health-checkin/swift.git", from: "0.2.0")
 ```
 
 Releases are `vX.Y.Z` tags; `from:` takes any later compatible one.
@@ -70,23 +70,35 @@ let made = try CheckinVerifier.makeRequest(smartRequest: request)
 
 // 2. After the DC API returns, open the response. `origin` MUST be the
 //    page's authenticated origin (the same one the browser bound the call to).
+//    It throws only when the response can't be used at all: it doesn't
+//    decrypt, has no SMART document or response element, or answers a
+//    different request (§8.5, [XV-1], [XV-2]).
 let result = try CheckinVerifier.openResponse(
     retainedState: made.retainedState,
     origin: "https://clinic.example",
     dcapiResponseBase64Url: dcapiResponse,
-    trustedIssuerKeys: clinicTrustList // [P256.Signing.PublicKey]
+    protocol: credential.protocol          // optional; a wrong value is a warning
 )
 
-// 3. Apply your app's policy.
-guard result.issuerSignatureValid,
-      result.deviceSignatureValid,
-      result.valueDigestMatches,
-      !result.crossValidation.hasErrors else { /* reject */ return }
-
-let smartResponse: SmartHealthCheckinResponse = result.smartResponse
+// 3. Use what passed §6.4; log what didn't.
+for warning in result.warnings { log("\(warning.code): \(warning.message)") }
+for item in request.items {
+    switch result.crossCheck.itemOutcomes[item.id] {
+    case .status(let code)?: use(code, result.crossCheck.usableArtifacts(for: item.id))
+    case .unknown(let why)?, nil: log("no valid status for \(item.id): \(String(describing: why))")
+    }
+}
 ```
 
-`VerifierResponseResult` deliberately reports each cryptographic boundary separately (`issuerSignatureValid`, `deviceSignatureValid`, `valueDigestMatches`, plus `crossValidation` for §6.4). Most apps should make policy on the individual signals; `result.allChecksPass` is provided as a convenience but is rarely the right gate.
+The Verifier is strict about what it builds and permissive about what it
+receives (§2 [RCV-0]..[RCV-2]). Signature, digest, MSO, validity, version, and
+padding problems don't throw: they come back in `result.warnings` with a short
+code (`issuer-signature`, `device-signature`, `digest`, `mso-validity`, …), and
+the individual booleans (`issuerSignatureValid`, `deviceSignatureValid`,
+`valueDigestMatches`) stay available. §6.4 problems affect one Artifact or one
+item: `result.crossCheck` lists the usable Artifacts, the disregarded ones with
+reasons, and each item's outcome. `result.allChecksPass` is `true` only when
+there are no warnings of either kind.
 
 ### Reader-authenticated requests
 
@@ -96,7 +108,7 @@ The kiosk can sign the request with a known reader key:
 let made = try CheckinVerifier.makeRequest(
     smartRequest: request,
     readerSigningKey: readerKey,                 // P256.Signing.PrivateKey
-    readerCertificateChain: [readerLeafCertDER], // optional x5chain
+    readerCertificateChain: [readerLeafCertDER], // optional; a self-signed one is minted otherwise
     origin: "https://clinic.example"
 )
 ```
@@ -109,10 +121,13 @@ import SmartHealthCheckin
 let parsed = try CheckinWallet.handleRequest(
     deviceRequestBase64Url: deviceRequestB64u,
     encryptionInfoBase64Url: encryptionInfoB64u,
-    origin: "https://clinic.example"   // browser-supplied
+    origin: requestingWebsiteOrigin    // from the platform only; a URL (iOS) works too
 )
 
-// Surface parsed.parsed.smartRequest to the user UI for consent…
+// Surface parsed.parsed.smartRequest to the user for item-by-item choice.
+// Items in parsed.parsed.unsupportedItems (unknown or malformed selectors)
+// get status `unsupported`; parsed.parsed.warnings lists request problems
+// that didn't stop the Wallet (§8.4).
 
 // Optional: verify readerAuth against your trust list.
 let st = SessionTranscript.dcapi(
@@ -135,11 +150,21 @@ let smartResponse = SmartHealthCheckinResponse(
 let dcapiResponseB64u = try parsed.assembler.reply(
     smartResponse: smartResponse,
     issuerKey: credentialIssuerKey,        // P256.Signing.PrivateKey
-    deviceKey: credentialDeviceKey,        // P256.Signing.PrivateKey
-    issuerCertificateChain: [issuerLeafDER]
+    deviceKey: credentialDeviceKey         // P256.Signing.PrivateKey
+    // issuerCertificateChain: optional; by default a self-signed certificate
+    // for issuerKey goes in x5chain ([WRS-4])
 )
 // → return this as the dcapi response
 ```
+
+`reply` refuses to build a response a strict Verifier would reject or partly
+disregard (a missing or doubled status row, an Artifact whose media type the
+item doesn't accept, and so on). A Holder who declines everything is answered
+with every item `declined` ([HOLD-4]).
+
+On iOS, the Identity Document Provider extension sees `requestInfo` only once
+the patient interacts: call `handleRequest` inside `sendResponse`, with
+`context.requestingWebsiteOrigin` as the origin.
 
 ## Lower layers
 
@@ -182,24 +207,34 @@ The library bakes in the spec's load‑bearing details:
 - The SMART JSON request body sits in `requestInfo[carrierKey]` as a CBOR **text string** (not a map, not base64url) per §8.2.
 - §5.1 strictness: the JSON parser rejects duplicate object members. Foundation's `JSONDecoder` and `JSONSerialization` silently accept them; the library does not use them.
 - COSE_Sign1 ES256 signatures are raw `R || S` (64 bytes), not DER.
-- `issuerAuth` payload is `Tag(24, bstr .cbor MSO)` (attached). `deviceSignature` payload is `Tag(24, bstr .cbor DeviceAuthentication)` (attached). `readerAuth` payload is **detached** — the COSE payload field is `nil`, the receiver reconstructs `ReaderAuthentication` from `SessionTranscript` + `ItemsRequestBytes`.
+- `issuerAuth` payload is `Tag(24, bstr .cbor MSO)` (attached), with the issuer certificate in `x5chain` (label 33, unprotected). `deviceSignature` and `readerAuth` payloads are **detached** (`nil`): the receiver rebuilds `DeviceAuthenticationBytes` / `ReaderAuthenticationBytes` from its own `SessionTranscript`. A received attached device payload that differs from the rebuilt bytes doesn't verify.
+- The MSO carries `validityInfo` (`signed` = `validFrom` = signing time, whole seconds, UTC).
 - Map ordering is RFC 8949 deterministic; non-shortest int / length encodings are rejected.
 - HPKE: DHKEM(P‑256, HKDF‑SHA256) + HKDF‑SHA256 + AES‑128‑GCM, `info = SessionTranscript`, `aad = h''`, base mode.
 - `DeviceAuthentication` binds the **exact** received `deviceSigned.nameSpaces` tag‑24 bytes — the library does not hardcode `{}`.
-- §6.4 cross‑validation: every `requestStatus` item ID exists in the request, every artifact's `mediaType` is in its target item's `accept[]`, etc.
+- The SessionTranscript origin is the ASCII serialization of the web origin, no trailing slash ([TR-2]); `CheckinOrigin.serialize` normalizes a platform-supplied URL.
+- Receivers fail only where §8 says so and warn otherwise ([RCV-0]..[RCV-2]). A malformed selector makes only its item `unsupported`; a malformed Artifact or status row affects only itself ([XV-3], [XV-4]).
+- §6.4 cross‑validation (`SmartHealthCheckinValidator.crossCheck`): an Artifact is usable only if every item it lists exists and accepts its `mediaType`, its FHIR release is one the request listed, and a `QuestionnaireResponse` echoes the requested canonical exactly.
 
 ## Testing
 
 ```sh
-scripts/fetch-fixtures.sh   # the spec's conformance fixtures, into the gitignored fixtures/
+scripts/fetch-fixtures.sh      # the spec's captured fixtures, into the gitignored fixtures/
+scripts/fetch-conformance.sh   # the spec's conformance cases, into spec-conformance/
 swift test
 ```
+
+`SpecConformanceTests` runs every spec conformance case (request and response
+JSON, cross-validation, request CBOR, transcript, HPKE, mdoc verification) and
+must pass them all: `conformance/known-failures.json` lists none. For warning
+cases it also checks the expected warning code is reported. CI then checks the
+credentials this wallet builds with the spec's reference verifier.
 
 `FixtureConformanceTests` reads the spec's fixtures at a pinned tag
 (`SPEC_FIXTURES_REF` in `scripts/fetch-fixtures.sh`, currently `fixtures-v2`).
 Set `SPEC_FIXTURES_DIR=../spec/fixtures` to test against a local spec checkout.
 
-47 tests covering the model layer, CBOR determinism + slice extraction, COSE_Sign1 round‑trip, HPKE seal/open, DeviceRequest + DeviceResponse build/parse with positive and negative cases, and a Verifier ↔ Wallet integration round‑trip. Plus a fixture test that decodes the actual demo's published `DigitalCredentialsRequest` (`sample.json`) and verifies its `readerAuth` COSE_Sign1 against the embedded leaf cert — this is the strongest proof that the library is byte-compatible with the demo wire format.
+Unit tests cover the model layer, CBOR determinism + slice extraction, COSE_Sign1 round‑trip, HPKE seal/open, DeviceRequest + DeviceResponse build/parse with positive and negative cases, and a Verifier ↔ Wallet integration round‑trip. Plus a fixture test that decodes the actual demo's published `DigitalCredentialsRequest` (`sample.json`) and verifies its `readerAuth` COSE_Sign1 against the embedded leaf cert — this is the strongest proof that the library is byte-compatible with the demo wire format.
 
 ```
 $ swift test --filter SampleFixtureTests
@@ -214,10 +249,10 @@ Executed 4 tests, with 0 failures
 
 The library implements the protocol; production deployments still need to:
 
-- Manage trust roots — supply real `trustedIssuerKeys` (or chain validation) instead of relying on the embedded leaf cert.
+- Decide what, if anything, to trust beyond integrity. Signatures show the mdoc is intact and well formed, not who issued it (§7); supply `trustedIssuerKeys` only if a deployment profile defines trusted issuers.
 - Bind to the authenticated origin from the platform credential manager / browser. Never accept an origin from inside the SMART JSON body.
 - Treat the verifier's `VerifierRetainedState` as ephemeral session state. Rotate per request.
-- Apply policy on `validityInfo` (`signed`, `validFrom`, `validUntil`).
+- Look at `result.warnings`: an MSO outside its validity window is reported as `mso-validity` ([VRS-10]), not rejected.
 - Handle `intentToRetain = false` semantics in your data layer.
 
 ## License

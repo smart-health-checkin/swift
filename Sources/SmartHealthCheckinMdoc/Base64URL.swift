@@ -32,6 +32,12 @@ public enum Base64URL {
     }
 }
 
+public extension Base64URL {
+    /// True when the string carries `=` padding, which base64url in this
+    /// profile omits. Receivers still decode it, with a warning ([WRQ-2], [VRS-2]).
+    static func isPadded(_ string: String) -> Bool { string.hasSuffix("=") }
+}
+
 public enum Base64URLError: Error, Equatable, Sendable {
     case invalidLength
     case invalidContent

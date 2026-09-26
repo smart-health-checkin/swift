@@ -86,6 +86,9 @@ public struct SmartHealthCheckinRequest: Equatable, Sendable {
             self.extensionMembers = extensionMembers
         }
 
+        /// Why a Wallet must answer this item `unsupported`, or nil.
+        public var unsupportedReason: String? { content.unsupportedReason }
+
         public static func == (lhs: Item, rhs: Item) -> Bool {
             guard lhs.id == rhs.id, lhs.title == rhs.title, lhs.summary == rhs.summary,
                   lhs.required == rhs.required, lhs.content == rhs.content,
@@ -105,12 +108,43 @@ public struct SmartHealthCheckinRequest: Equatable, Sendable {
         /// An extension selector with an unrecognized `kind`. The wallet/verifier
         /// must NOT silently treat unknown selector kinds as a known one.
         case ext(kind: String, members: [(key: String, value: JSONValue)])
+        /// A core `kind` whose members are malformed (e.g. `profilesFrom` is a
+        /// string, or a form has no Questionnaire). The request stands; this
+        /// item is `unsupported` ([SEL-8], [SEL-10], [FORM-1]). The source
+        /// members are kept verbatim so the request round-trips.
+        case invalid(kind: String, members: [(key: String, value: JSONValue)], reason: String)
 
         public var kind: String {
             switch self {
             case .selectionFhir: return SmartHealthCheckinConstants.selectorKindSelectionFhir
             case .formFhir:      return SmartHealthCheckinConstants.selectorKindFormFhir
             case .ext(let k, _): return k
+            case .invalid(let k, _, _): return k
+            }
+        }
+
+        /// Why a Wallet must answer this selector `unsupported`, or nil if it
+        /// is a well-formed core selector ([SEL-8], [SEL-9], [SEL-10], [FORM-1]).
+        public var unsupportedReason: String? {
+            switch self {
+            case .ext(let k, _):
+                return "selector kind '\(k)' is not supported"
+            case .invalid(_, _, let reason):
+                return reason
+            case .selectionFhir(let s):
+                if s.profiles?.isEmpty == true { return "profiles must be a non-empty array" }
+                if s.profilesFrom?.isEmpty == true { return "profilesFrom must be a non-empty array" }
+                if s.resourceTypes?.isEmpty == true { return "resourceTypes must be a non-empty array" }
+                return nil
+            case .formFhir(let f):
+                if f.questionnaireCanonical == nil && f.questionnaire == nil {
+                    return "form.fhir needs questionnaireCanonical or questionnaire"
+                }
+                if let qc = f.questionnaireCanonical, qc.isEmpty { return "questionnaireCanonical must be non-empty" }
+                if let q = f.questionnaire, q["resourceType"]?.stringValue != "Questionnaire" {
+                    return "questionnaire must be a FHIR Questionnaire"
+                }
+                return nil
             }
         }
 
@@ -120,6 +154,12 @@ public struct SmartHealthCheckinRequest: Equatable, Sendable {
             case (.formFhir(let a),      .formFhir(let b)):      return a == b
             case (.ext(let ka, let ma), .ext(let kb, let mb)):
                 if ka != kb || ma.count != mb.count { return false }
+                for (i, m) in ma.enumerated() {
+                    if m.key != mb[i].key || m.value != mb[i].value { return false }
+                }
+                return true
+            case (.invalid(let ka, let ma, let ra), .invalid(let kb, let mb, let rb)):
+                if ka != kb || ra != rb || ma.count != mb.count { return false }
                 for (i, m) in ma.enumerated() {
                     if m.key != mb[i].key || m.value != mb[i].value { return false }
                 }
@@ -227,7 +267,7 @@ public extension SmartHealthCheckinRequest {
             case "purpose":
                 purpose = try requireString(vv, path: "$.purpose")
             case "fhirVersions":
-                fhirVersions = try requireStringArray(vv, path: "$.fhirVersions", allowEmpty: false)
+                fhirVersions = try requireStringArray(vv, path: "$.fhirVersions", allowEmpty: true)
             case "items":
                 guard case .array(let a) = vv else { throw ModelDecodeError.expectedArray(path: "$.items") }
                 itemsRaw = a
@@ -307,20 +347,23 @@ public extension SmartHealthCheckinRequest.Selector {
             if let q = f.questionnaire { o.append(("questionnaire", q)) }
             for em in f.extensionMembers { o.append((em.key, em.value)) }
             return .object(o)
-        case .ext(let k, let m):
+        case .ext(let k, let m), .invalid(let k, let m, _):
             var o: [(key: String, value: JSONValue)] = [("kind", .string(k))]
             for em in m { o.append((em.key, em.value)) }
             return .object(o)
         }
     }
 
+    /// Parse `content`. A non-object `content` or a non-string `kind` makes the
+    /// whole request invalid ([REQ-2]); any other problem inside a core
+    /// selector yields `.invalid`, so only that item is unsupported.
     static func fromJSON(_ v: JSONValue, path: String) throws -> SmartHealthCheckinRequest.Selector {
         guard let members = v.objectMembers else { throw ModelDecodeError.expectedObject(path: path) }
         var kind: String?
         var others: [(key: String, value: JSONValue)] = []
         for (k, vv) in members {
             if k == "kind" {
-                kind = try requireNonEmptyString(vv, path: "\(path).kind")
+                kind = try requireString(vv, path: "\(path).kind")
             } else {
                 others.append((k, vv))
             }
@@ -330,33 +373,45 @@ public extension SmartHealthCheckinRequest.Selector {
         case SmartHealthCheckinConstants.selectorKindSelectionFhir:
             var profiles: [String]?, profilesFrom: [String]?, resourceTypes: [String]?
             var extras: [(key: String, value: JSONValue)] = []
-            for (k, vv) in others {
-                switch k {
-                case "profiles":      profiles = try requireStringArray(vv, path: "\(path).profiles", allowEmpty: false)
-                case "profilesFrom":  profilesFrom = try requireStringArray(vv, path: "\(path).profilesFrom", allowEmpty: false)
-                case "resourceTypes": resourceTypes = try requireStringArray(vv, path: "\(path).resourceTypes", allowEmpty: false)
-                case "questionnaireCanonical", "questionnaire":
-                    throw ModelDecodeError.invalid(path: "\(path).\(k)", reason: "MUST NOT be present on selection.fhir")
-                default:
-                    extras.append((k, vv))
+            do {
+                for (k, vv) in others {
+                    switch k {
+                    case "profiles":      profiles = try requireStringArray(vv, path: "\(path).profiles", allowEmpty: false)
+                    case "profilesFrom":  profilesFrom = try requireStringArray(vv, path: "\(path).profilesFrom", allowEmpty: false)
+                    case "resourceTypes": resourceTypes = try requireStringArray(vv, path: "\(path).resourceTypes", allowEmpty: false)
+                    case "questionnaireCanonical", "questionnaire":
+                        throw ModelDecodeError.invalid(path: "\(path).\(k)", reason: "not allowed on selection.fhir")
+                    default:
+                        extras.append((k, vv))
+                    }
                 }
+            } catch let e as ModelDecodeError {
+                return .invalid(kind: kind, members: others, reason: e.description)
             }
             return .selectionFhir(.init(profiles: profiles, profilesFrom: profilesFrom, resourceTypes: resourceTypes, extensionMembers: extras))
         case SmartHealthCheckinConstants.selectorKindFormFhir:
             var qc: String?
             var q: JSONValue?
             var extras: [(key: String, value: JSONValue)] = []
-            for (k, vv) in others {
-                switch k {
-                case "questionnaireCanonical": qc = try requireNonEmptyString(vv, path: "\(path).questionnaireCanonical")
-                case "questionnaire":          q = vv
-                case "profiles", "profilesFrom", "resourceTypes":
-                    throw ModelDecodeError.invalid(path: "\(path).\(k)", reason: "MUST NOT be present on form.fhir")
-                default:
-                    extras.append((k, vv))
+            do {
+                for (k, vv) in others {
+                    switch k {
+                    case "questionnaireCanonical": qc = try requireNonEmptyString(vv, path: "\(path).questionnaireCanonical")
+                    case "questionnaire":          q = vv
+                    case "profiles", "profilesFrom", "resourceTypes":
+                        throw ModelDecodeError.invalid(path: "\(path).\(k)", reason: "not allowed on form.fhir")
+                    default:
+                        extras.append((k, vv))
+                    }
                 }
+            } catch let e as ModelDecodeError {
+                return .invalid(kind: kind, members: others, reason: e.description)
             }
-            return .formFhir(.init(questionnaireCanonical: qc, questionnaire: q, extensionMembers: extras))
+            let form = SmartHealthCheckinRequest.FormFhir(questionnaireCanonical: qc, questionnaire: q, extensionMembers: extras)
+            if let reason = SmartHealthCheckinRequest.Selector.formFhir(form).unsupportedReason {
+                return .invalid(kind: kind, members: others, reason: reason)
+            }
+            return .formFhir(form)
         default:
             return .ext(kind: kind, members: others)
         }

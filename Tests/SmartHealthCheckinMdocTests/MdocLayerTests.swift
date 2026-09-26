@@ -146,8 +146,9 @@ final class MdocLayerTests: XCTestCase {
         XCTAssertEqual(parsed.documents.count, 1)
         // ISO 18013-5: deviceSignature carries a detached (null) payload;
         // issuerAuth carries the MSO.
-        XCTAssertNil(parsed.documents[0].deviceSigned.deviceSignature.payload)
-        XCTAssertNotNil(parsed.documents[0].issuerSigned.issuerAuth.payload)
+        XCTAssertNotNil(parsed.documents[0].deviceSigned.deviceSignature)
+        XCTAssertNil(parsed.documents[0].deviceSigned.deviceSignature?.payload)
+        XCTAssertNotNil(parsed.documents[0].issuerSigned.issuerAuth?.payload)
 
         let report = try DeviceResponseValidator.validate(
             parsed,

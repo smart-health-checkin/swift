@@ -54,20 +54,24 @@ public struct VerifierRetainedState {
 public struct VerifierResponseResult {
     public let smartResponse: SmartHealthCheckinResponse
     public let smartResponseJSON: Data
-    public let crossValidation: ValidationReport
+    /// §6.4 against the original request: the Artifacts to use, the ones to
+    /// disregard and why, and each item's outcome.
+    public let crossCheck: CrossCheck
+    public var crossValidation: ValidationReport { crossCheck.report }
     public let issuerSignatureValid: Bool
     public let deviceSignatureValid: Bool
     public let valueDigestMatches: Bool
-    public let validityInfo: MobileSecurityObject.ValidityInfo
+    /// nil when the MSO has no readable validityInfo.
+    public let validityInfo: MobileSecurityObject.ValidityInfo?
     public let issuerCertificateChain: [Data]
     public let docType: String
+    /// Transport and crypto problems that didn't stop the Verifier ([RCV-1]):
+    /// signatures, digests, MSO fields, validity, versions, padding.
+    public let warnings: [CheckinWarning]
 
-    /// Convenience: `true` only if every cryptographic boundary checks out
-    /// AND the SMART model cross-validation produced no errors. Most apps
-    /// should examine the individual fields rather than this aggregate.
+    /// `true` when there are no transport warnings and no §6.4 warnings.
     public var allChecksPass: Bool {
-        return issuerSignatureValid && deviceSignatureValid && valueDigestMatches
-            && !crossValidation.hasErrors
+        warnings.isEmpty && crossCheck.report.issues.isEmpty
     }
 }
 
@@ -77,6 +81,10 @@ public enum CheckinVerifierError: Error, Sendable {
     case hpkeOpenFailed
     case responseModelMalformed(String)
     case noDocumentsInResponse
+    /// No response element with a text value ([VRS-8]).
+    case responseElementMissing(String)
+    /// The response fails §6.4 as a whole ([XV-1], [XV-2]).
+    case responseRejected(ValidationReport)
 }
 
 public enum CheckinVerifier {
@@ -138,11 +146,18 @@ public enum CheckinVerifier {
             let (_, itemsRequestTag24Bytes) = DeviceRequestBuilder.build(
                 smartRequestJSON: smartJSON, options: opts, readerAuth: nil
             )
-            let st = SessionTranscript.dcapi(encryptionInfoBase64Url: encInfoB64u, origin: origin)
+            let st = SessionTranscript.dcapi(encryptionInfoBase64Url: encInfoB64u, origin: CheckinOrigin.serialize(origin))
             let payload = ReaderAuth.readerAuthenticationBytes(
                 sessionTranscript: st, itemsRequestTag24Bytes: itemsRequestTag24Bytes
             )
             var unprotected: [CBORMapEntry] = []
+            // [RA-1] x5chain holds at least the signing certificate; self-sign
+            // one when the caller has none.
+            var readerCertificateChain = readerCertificateChain
+            if readerCertificateChain.isEmpty {
+                readerCertificateChain = [try X509Helper.selfSignedCertificate(
+                    for: readerKey, commonName: "SMART Health Check-in Verifier")]
+            }
             if !readerCertificateChain.isEmpty {
                 unprotected.append(.init(
                     key: .int(33),
@@ -172,24 +187,35 @@ public enum CheckinVerifier {
         return (deviceRequestB64u, encInfoB64u, state)
     }
 
-    /// Open and verify a `dcapiResponse` from the wallet.
+    /// Open and verify a `dcapiResponse` from the wallet (§8.5).
     ///
-    /// Returns a structured result with separate trust signals. Callers should
-    /// apply policy on these signals — do not assume `.allChecksPass` matches
-    /// their threat model.
+    /// Throws only where §8.5 says **fail**: the response doesn't decode or
+    /// lacks `enc`/`cipherText`, it doesn't decrypt, there's no SMART document
+    /// or response element, or the SMART response fails §6.4 as a whole
+    /// ([XV-1], [XV-2]). Signatures, digests, and MSO problems come back as
+    /// `warnings`; per-Artifact and per-item results as `crossCheck`.
     public static func openResponse(
         retainedState: VerifierRetainedState,
         origin: String,
         dcapiResponseBase64Url: String,
-        trustedIssuerKeys: [P256.Signing.PublicKey]? = nil
+        protocol dcProtocol: String? = nil,
+        trustedIssuerKeys: [P256.Signing.PublicKey]? = nil,
+        now: Date = Date()
     ) throws -> VerifierResponseResult {
-        let respBytes = try Base64URL.decode(dcapiResponseBase64Url)
-        let env: (enc: Data, ciphertext: Data)
-        do { env = try DCAPIResponse.decode(respBytes) }
+        var warnings: [CheckinWarning] = []
+        if let p = dcProtocol, p != SmartHealthCheckinConstants.dcApiProtocol {
+            warnings.append(.init("protocol", "the credential's protocol is \"\(p)\", not \"\(SmartHealthCheckinConstants.dcApiProtocol)\" ([VRS-2])"))
+        }
+        if Base64URL.isPadded(dcapiResponseBase64Url) {
+            warnings.append(.init("base64url-padding", "data.response uses padded base64url ([VRS-2])"))
+        }
+        let env: (enc: Data, ciphertext: Data, warnings: [CheckinWarning])
+        do { env = try DCAPIResponse.decodeLenient(try Base64URL.decode(dcapiResponseBase64Url)) }
         catch { throw CheckinVerifierError.dcapiResponseMalformed }
+        warnings += env.warnings
 
         let st = SessionTranscript.dcapi(
-            encryptionInfoBase64Url: retainedState.encryptionInfoBase64Url, origin: origin
+            encryptionInfoBase64Url: retainedState.encryptionInfoBase64Url, origin: CheckinOrigin.serialize(origin)
         )
         let plaintext: Data
         do {
@@ -203,39 +229,48 @@ public enum CheckinVerifier {
             throw CheckinVerifierError.hpkeOpenFailed
         }
 
-        let parsed = try DeviceResponseParser.parse(plaintext)
-        let validation = try DeviceResponseValidator.validate(
-            parsed,
-            sessionTranscript: st,
-            options: .init(
-                docType: SmartHealthCheckinConstants.mdocDocType,
-                namespace: SmartHealthCheckinConstants.mdocNamespace,
-                element: SmartHealthCheckinConstants.mdocElementIdentifier,
-                trustedIssuerKeys: trustedIssuerKeys
+        let validation: CheckinDeviceResponseValidation
+        do {
+            let parsed = try DeviceResponseParser.parse(plaintext)
+            validation = try DeviceResponseValidator.validate(
+                parsed,
+                sessionTranscript: st,
+                options: .init(
+                    docType: SmartHealthCheckinConstants.mdocDocType,
+                    namespace: SmartHealthCheckinConstants.mdocNamespace,
+                    element: SmartHealthCheckinConstants.mdocElementIdentifier,
+                    trustedIssuerKeys: trustedIssuerKeys,
+                    now: now
+                )
             )
-        )
+        } catch {
+            throw CheckinVerifierError.responseElementMissing(String(describing: error))
+        }
+        warnings += validation.warnings
 
-        // Parse SMART JSON and run §6.4 cross-validation.
+        // [VRS-9] Parse the SMART response and validate it (§6.4).
         let smartResp: SmartHealthCheckinResponse
         do {
             smartResp = try SmartHealthCheckinResponse.parse(validation.smartResponseJSON)
         } catch {
             throw CheckinVerifierError.responseModelMalformed(String(describing: error))
         }
-        let crossReport = SmartHealthCheckinValidator.crossValidate(
+        let check = SmartHealthCheckinValidator.crossCheck(
             request: retainedState.smartRequest, response: smartResp
         )
+        if check.report.hasErrors { throw CheckinVerifierError.responseRejected(check.report) }
 
         return VerifierResponseResult(
             smartResponse: smartResp,
             smartResponseJSON: validation.smartResponseJSON,
-            crossValidation: crossReport,
+            crossCheck: check,
             issuerSignatureValid: validation.issuerSignatureValid,
             deviceSignatureValid: validation.deviceSignatureValid,
             valueDigestMatches: validation.digestMatch,
             validityInfo: validation.validityInfo,
             issuerCertificateChain: validation.issuerCertificateChain,
-            docType: validation.docType
+            docType: validation.docType,
+            warnings: warnings
         )
     }
 
