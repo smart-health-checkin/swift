@@ -19,6 +19,8 @@
     "request-cbor/padded-base64url": "Base64URL.decode accepts padding",
     "hpke-open/padded-base64url": "Base64URL.decode accepts padding",
     "mdoc-verify/status-not-ok": "DeviceResponseValidator doesn't check DeviceResponse status",
-    "mdoc-verify/unsupported-digest-algorithm": "DeviceResponseValidator doesn't check MSO digestAlgorithm"
+    "mdoc-verify/unsupported-digest-algorithm": "DeviceResponseValidator doesn't check MSO digestAlgorithm",
+    "wallet-response/capture-v2-request": "issuerAuth has no x5chain: reply() defaults to an empty certificate chain and the package can't mint a self-signed issuer certificate",
+    "wallet-response/synthetic-request": "issuerAuth has no x5chain: reply() defaults to an empty certificate chain and the package can't mint a self-signed issuer certificate"
   }
 }
