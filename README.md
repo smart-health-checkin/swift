@@ -196,7 +196,7 @@ swift test
 ```
 
 `FixtureConformanceTests` reads the spec's fixtures at a pinned tag
-(`SPEC_FIXTURES_REF` in `scripts/fetch-fixtures.sh`, currently `fixtures-v1`).
+(`SPEC_FIXTURES_REF` in `scripts/fetch-fixtures.sh`, currently `fixtures-v2`).
 Set `SPEC_FIXTURES_DIR=../spec/fixtures` to test against a local spec checkout.
 
 47 tests covering the model layer, CBOR determinism + slice extraction, COSE_Sign1 round‑trip, HPKE seal/open, DeviceRequest + DeviceResponse build/parse with positive and negative cases, and a Verifier ↔ Wallet integration round‑trip. Plus a fixture test that decodes the actual demo's published `DigitalCredentialsRequest` (`sample.json`) and verifies its `readerAuth` COSE_Sign1 against the embedded leaf cert — this is the strongest proof that the library is byte-compatible with the demo wire format.
