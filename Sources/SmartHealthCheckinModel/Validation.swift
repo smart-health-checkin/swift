@@ -42,11 +42,42 @@ public struct ValidationReport: Equatable, Sendable, CustomStringConvertible {
     public var description: String { issues.map(\.description).joined(separator: "\n") }
 }
 
+/// The result of checking a SMART response against the request it answers
+/// (§6.4). Only [XV-1]/[XV-2] problems are errors in `report` (reject the
+/// whole response). Everything else affects one Artifact or one item, and is
+/// reported as a warning plus the per-Artifact and per-item results below.
+public struct CrossCheck: Equatable, Sendable {
+    public enum ItemOutcome: Equatable, Sendable {
+        /// The item has exactly one valid status row.
+        case status(RequestItemStatus.Code)
+        /// No valid status: the row is missing, duplicated, or unparseable ([XV-3]).
+        case unknown(reason: String)
+    }
+    public struct DisregardedArtifact: Equatable, Sendable {
+        public var id: String?
+        public var reason: String
+    }
+    public var report: ValidationReport
+    /// Artifacts that passed every check, in response order ([XV-4]).
+    public var usableArtifacts: [Artifact]
+    /// Artifacts the Verifier must not use, with why ([XV-4]..[XV-10]).
+    public var disregardedArtifacts: [DisregardedArtifact]
+    /// One outcome per request item, keyed by item id.
+    public var itemOutcomes: [String: ItemOutcome]
+
+    /// Artifacts usable for one item.
+    public func usableArtifacts(for itemId: String) -> [Artifact] {
+        usableArtifacts.filter { $0.fulfills.contains(itemId) }
+    }
+}
+
 public enum SmartHealthCheckinValidator {
 
-    /// Run §5 request validation. Returns a report with any issues found.
-    /// Errors in this report mean the request is non-conformant; warnings flag
-    /// likely-but-not-required problems.
+    /// §5 request validation. Errors mean the request as a whole must be
+    /// rejected ([REQ-2], [ITEM-2]). An item whose selector the Wallet can't
+    /// process is not an error: it is reported as a warning and the Wallet
+    /// answers it `unsupported` ([SEL-8], [SEL-9], [SEL-10], [FORM-1]); see
+    /// `unsupportedItems(in:)`.
     public static func validate(request: SmartHealthCheckinRequest) -> ValidationReport {
         var r = ValidationReport()
         if request.type != SmartHealthCheckinConstants.requestType {
@@ -57,7 +88,6 @@ public enum SmartHealthCheckinValidator {
         }
         if request.id.isEmpty { r.error("$.id", "must be non-empty") }
 
-        // Items
         var ids = Set<String>()
         for (i, item) in request.items.enumerated() {
             let p = "$.items[\(i)]"
@@ -67,46 +97,39 @@ public enum SmartHealthCheckinValidator {
             }
             if item.title.isEmpty { r.error("\(p).title", "must be non-empty") }
             if item.accept.isEmpty { r.error("\(p).accept", "must be non-empty array") }
-
-            switch item.content {
-            case .selectionFhir(let s):
-                if let p2 = s.profiles, p2.isEmpty { r.error("\(p).content.profiles", "must be non-empty if present") }
-                if let pf = s.profilesFrom, pf.isEmpty { r.error("\(p).content.profilesFrom", "must be non-empty if present") }
-                if let rt = s.resourceTypes, rt.isEmpty { r.error("\(p).content.resourceTypes", "must be non-empty if present") }
-            case .formFhir(let f):
-                if f.questionnaireCanonical == nil && f.questionnaire == nil {
-                    r.error("\(p).content", "form.fhir requires questionnaireCanonical or questionnaire")
-                }
-                if let qc = f.questionnaireCanonical, qc.isEmpty {
-                    r.error("\(p).content.questionnaireCanonical", "must be non-empty if present")
-                }
-                if let q = f.questionnaire {
-                    if let resourceType = q["resourceType"]?.stringValue {
-                        if resourceType != "Questionnaire" {
-                            r.error("\(p).content.questionnaire.resourceType", "must be 'Questionnaire'")
-                        }
-                    } else {
-                        r.error("\(p).content.questionnaire.resourceType", "must be 'Questionnaire'")
-                    }
-                }
-            case .ext:
-                r.warning("\(p).content.kind", "extension selector kind; receiver must implement it explicitly")
+            if let reason = item.unsupportedReason {
+                r.warning("\(p).content", "item '\(item.id)' is unsupported: \(reason)")
             }
         }
         return r
     }
 
-    /// §6.4 Verifier cross-validation. Validates the SMART response JSON
-    /// against the SMART request that produced it. Run AFTER parsing both
-    /// (which has already enforced §6.1 shape rules and rejected duplicate
-    /// JSON members).
+    /// Items a Wallet must answer `unsupported`, keyed by item id, with why.
+    public static func unsupportedItems(in request: SmartHealthCheckinRequest) -> [String: String] {
+        var out: [String: String] = [:]
+        for item in request.items { if let reason = item.unsupportedReason { out[item.id] = reason } }
+        return out
+    }
+
+    /// §6.4 Verifier cross-validation, as a report. Errors are only the
+    /// whole-response failures ([XV-1], [XV-2]); per-Artifact and per-item
+    /// problems are warnings. Use `crossCheck` for the per-Artifact and
+    /// per-item results.
     public static func crossValidate(
         request: SmartHealthCheckinRequest,
         response: SmartHealthCheckinResponse
     ) -> ValidationReport {
+        crossCheck(request: request, response: response).report
+    }
+
+    /// §6.4 Verifier cross-validation. Run after parsing both messages.
+    public static func crossCheck(
+        request: SmartHealthCheckinRequest,
+        response: SmartHealthCheckinResponse
+    ) -> CrossCheck {
         var r = ValidationReport()
 
-        // type / version / requestId
+        // [XV-1] (parse already enforces these for parsed responses) and [XV-2].
         if response.type != SmartHealthCheckinConstants.responseType {
             r.error("$.type", "must be exactly '\(SmartHealthCheckinConstants.responseType)'")
         }
@@ -117,81 +140,89 @@ public enum SmartHealthCheckinValidator {
             r.error("$.requestId", "must equal request id (got '\(response.requestId)', expected '\(request.id)')")
         }
 
-        // Build accept-set per item id
-        var acceptByItem: [String: [String]] = [:]
-        var validItemIds = Set<String>()
-        for item in request.items {
-            acceptByItem[item.id] = item.accept
-            validItemIds.insert(item.id)
+        let itemsById = Dictionary(request.items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var disregarded: [CrossCheck.DisregardedArtifact] = response.disregardedArtifacts.map {
+            r.warning("$.artifacts[\($0.index)]", "disregarded: \($0.reason)")
+            return .init(id: $0.id, reason: $0.reason)
         }
+        var usable: [Artifact] = []
+        let requestedReleases = request.fhirVersions ?? []
 
-        // Artifact constraints
-        var artifactIds = Set<String>()
-        for (i, art) in response.artifacts.enumerated() {
-            let p = "$.artifacts[\(i)]"
-            if art.id.isEmpty {
-                r.error("\(p).id", "must be non-empty")
-            } else if !artifactIds.insert(art.id).inserted {
-                r.error("\(p).id", "duplicate artifact id '\(art.id)'")
+        for art in response.artifacts {
+            func reason() -> String? {
+                if art.fulfills.isEmpty { return "fulfills[] is empty" }
+                for fid in art.fulfills {
+                    guard let item = itemsById[fid] else { return "fulfills names '\(fid)', which is not a request item" }
+                    if !item.accept.contains(art.mediaType) {
+                        return "mediaType '\(art.mediaType)' is not in accept[] for item '\(fid)'"
+                    }
+                }
+                switch art {
+                case .ext:
+                    return "mediaType '\(art.mediaType)' is not a supported media type"
+                case .smartHealthCard(let a):
+                    if a.verifiableCredentials.isEmpty { return "verifiableCredential[] is empty" }
+                case .fhirJson(let a):
+                    if a.fhirVersion.isEmpty { return "fhirVersion is empty" }
+                    if a.value["resourceType"]?.stringValue == nil { return "value has no resourceType" }
+                    // [XV-8] SHOULD: a release the request didn't list is unusable.
+                    if !requestedReleases.isEmpty && !requestedReleases.contains(a.fhirVersion) {
+                        return "fhirVersion '\(a.fhirVersion)' is not among the request's fhirVersions"
+                    }
+                    // [XV-10] A QuestionnaireResponse answering a form item with a canonical echoes it exactly.
+                    if a.value["resourceType"]?.stringValue == "QuestionnaireResponse" {
+                        for fid in art.fulfills {
+                            if case .formFhir(let f)? = itemsById[fid]?.content, let qc = f.questionnaireCanonical,
+                               a.value["questionnaire"]?.stringValue != qc {
+                                return "QuestionnaireResponse.questionnaire does not equal '\(qc)' for item '\(fid)'"
+                            }
+                        }
+                    }
+                }
+                return nil
             }
-            if art.fulfills.isEmpty {
-                r.error("\(p).fulfills", "must be non-empty")
-            }
-            // case-sensitive media type comparison
-            for (j, fid) in art.fulfills.enumerated() {
-                guard validItemIds.contains(fid) else {
-                    r.error("\(p).fulfills[\(j)]", "no request item with id '\(fid)'")
-                    continue
-                }
-                if let accept = acceptByItem[fid], !accept.contains(art.mediaType) {
-                    r.error("\(p).mediaType", "'\(art.mediaType)' is not in accept[] for item '\(fid)'")
-                }
-            }
-            switch art {
-            case .fhirJson(let a):
-                if a.fhirVersion.isEmpty {
-                    r.error("\(p).fhirVersion", "must be non-empty for application/fhir+json")
-                }
-                // Bundles must not mix FHIR releases — best-effort: a Bundle's
-                // entries don't carry fhirVersion themselves, but if any
-                // resource has meta.versionId vs the wrapper, that's a
-                // deployment concern. Here we only flag obvious issues.
-                if a.value["resourceType"]?.stringValue == nil {
-                    r.error("\(p).value.resourceType", "must be a non-empty string")
-                }
-            case .smartHealthCard(let a):
-                if a.verifiableCredentials.isEmpty {
-                    r.error("\(p).value.verifiableCredential", "must contain at least one entry")
-                }
-            case .ext:
-                r.warning("\(p).mediaType", "non-core media type; receiver must implement an explicit extension to consume it")
+            if let why = reason() {
+                r.warning("$.artifacts[id=\(art.id)]", "disregarded: \(why)")
+                disregarded.append(.init(id: art.id, reason: why))
+            } else {
+                usable.append(art)
             }
         }
 
-        // requestStatus must cover every item exactly once, no duplicates, no unknown ids.
-        var seenStatusItems = Set<String>()
-        for (i, st) in response.requestStatus.enumerated() {
-            let p = "$.requestStatus[\(i)]"
-            if !validItemIds.contains(st.item) {
-                r.error("\(p).item", "no request item with id '\(st.item)'")
-            }
-            if !seenStatusItems.insert(st.item).inserted {
-                r.error("\(p).item", "duplicate status entry for item '\(st.item)'")
-            }
-        }
-        for itemId in validItemIds where !seenStatusItems.contains(itemId) {
-            r.error("$.requestStatus", "missing entry for request item '\(itemId)'")
-        }
-
-        // §6.2 advisory: fulfilled / partial SHOULD be backed by an artifact.
-        let artifactsByItem: [String: [Artifact]] = response.artifacts.reduce(into: [:]) { acc, a in
-            for f in a.fulfills { acc[f, default: []].append(a) }
-        }
+        // [XV-3] One valid status row per item; rows for other ids are ignored.
+        var rowsByItem: [String: [RequestItemStatus]] = [:]
         for st in response.requestStatus {
-            if (st.status == .fulfilled || st.status == .partial) && (artifactsByItem[st.item]?.isEmpty ?? true) {
-                r.warning("$.requestStatus", "item '\(st.item)' is \(st.status.rawValue) but no artifact fulfills it")
+            if itemsById[st.item] == nil {
+                r.warning("$.requestStatus", "ignored a status row for '\(st.item)', which is not a request item")
+                continue
+            }
+            rowsByItem[st.item, default: []].append(st)
+        }
+        let badRowItems = Set(response.disregardedStatus.compactMap(\.id))
+        var outcomes: [String: CrossCheck.ItemOutcome] = [:]
+        for item in request.items {
+            let rows = rowsByItem[item.id] ?? []
+            if badRowItems.contains(item.id) {
+                outcomes[item.id] = .unknown(reason: "its status row could not be read")
+            } else if rows.count == 1 {
+                outcomes[item.id] = .status(rows[0].status)
+            } else if rows.isEmpty {
+                outcomes[item.id] = .unknown(reason: "no status row")
+            } else {
+                outcomes[item.id] = .unknown(reason: "\(rows.count) status rows")
+            }
+            if case .unknown(let why)? = outcomes[item.id] {
+                r.warning("$.requestStatus", "item '\(item.id)' has no valid status: \(why)")
             }
         }
-        return r
+
+        // [XV-12] SHOULD flag fulfilled/partial items no usable Artifact lists.
+        for (id, outcome) in outcomes {
+            if case .status(let code) = outcome, code == .fulfilled || code == .partial,
+               !usable.contains(where: { $0.fulfills.contains(id) }) {
+                r.warning("$.requestStatus", "item '\(id)' is \(code.rawValue) but no usable Artifact lists it")
+            }
+        }
+        return CrossCheck(report: r, usableArtifacts: usable, disregardedArtifacts: disregarded, itemOutcomes: outcomes)
     }
 }

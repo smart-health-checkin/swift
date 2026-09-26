@@ -94,8 +94,21 @@ final class RequestModelTests: XCTestCase {
         XCTAssertEqual(req, req2)
     }
 
-    func testRejectsConflictingSelectorMembers() {
-        let json = #"{"type":"smart-health-checkin-request","version":"1","id":"x","items":[{"id":"a","title":"A","content":{"kind":"selection.fhir","questionnaire":{}},"accept":["application/fhir+json"]}]}"#
+    // [SEL-8] A selector problem makes only that item unsupported; the request stands.
+    func testConflictingSelectorMembersMakeItemUnsupported() throws {
+        let json = #"{"type":"smart-health-checkin-request","version":"1","id":"x","items":[{"id":"a","title":"A","content":{"kind":"selection.fhir","questionnaire":{}},"accept":["application/fhir+json"]},{"id":"b","title":"B","content":{"kind":"selection.fhir"},"accept":["application/fhir+json"]}]}"#
+        let req = try SmartHealthCheckinRequest.parse(json)
+        XCTAssertFalse(SmartHealthCheckinValidator.validate(request: req).hasErrors)
+        XCTAssertNotNil(req.items[0].unsupportedReason)
+        XCTAssertNil(req.items[1].unsupportedReason)
+        XCTAssertEqual(Set(SmartHealthCheckinValidator.unsupportedItems(in: req).keys), ["a"])
+        // The malformed selector round-trips verbatim.
+        XCTAssertEqual(try SmartHealthCheckinRequest.parse(req.toJSONString()), req)
+    }
+
+    // [REQ-2] content that isn't an object with a string kind invalidates the whole request.
+    func testNonObjectContentRejectsRequest() {
+        let json = #"{"type":"smart-health-checkin-request","version":"1","id":"x","items":[{"id":"a","title":"A","content":"x","accept":["application/fhir+json"]}]}"#
         XCTAssertThrowsError(try SmartHealthCheckinRequest.parse(json))
     }
 
@@ -151,12 +164,25 @@ final class ResponseModelTests: XCTestCase {
         XCTAssertEqual(try SmartHealthCheckinResponse.parse(s), resp)
     }
 
-    func testShcArtifactRejectsOuterFhirVersion() {
+    // [XV-4], [XV-9] A health card with an outer fhirVersion is disregarded; the response stands.
+    func testShcArtifactWithOuterFhirVersionIsDisregarded() throws {
         let json = #"""
         {"type":"smart-health-checkin-response","version":"1","requestId":"r-1","artifacts":[
-          {"id":"a","mediaType":"application/smart-health-card","fhirVersion":"4.0.1","fulfills":["x"],"value":{"verifiableCredential":["shc:/1"]}}
-        ],"requestStatus":[{"item":"x","status":"fulfilled"}]}
+          {"id":"a","mediaType":"application/smart-health-card","fhirVersion":"4.0.1","fulfills":["x"],"value":{"verifiableCredential":["shc:/1"]}},
+          {"id":"b","mediaType":"application/fhir+json","fhirVersion":"4.0.1","fulfills":["x"],"value":{"resourceType":"Patient"}}
+        ],"requestStatus":[{"item":"x","status":"fulfilled"},{"item":"x","status":"bogus"}]}
         """#
+        let resp = try SmartHealthCheckinResponse.parse(json)
+        XCTAssertEqual(resp.artifacts.map(\.id), ["b"])
+        XCTAssertEqual(resp.disregardedArtifacts.map(\.id), ["a"])
+        XCTAssertEqual(resp.disregardedStatus.count, 1)
+        // Set-aside entries go back in place, so the response round-trips.
+        XCTAssertEqual(try SmartHealthCheckinResponse.parse(resp.toJSONString()), resp)
+    }
+
+    // [XV-1] type and version are whole-response checks.
+    func testWrongVersionRejectsResponse() {
+        let json = #"{"type":"smart-health-checkin-response","version":"2","requestId":"r","artifacts":[],"requestStatus":[]}"#
         XCTAssertThrowsError(try SmartHealthCheckinResponse.parse(json))
     }
 }
@@ -218,8 +244,11 @@ final class CrossValidationTests: XCTestCase {
             ],
             requestStatus: req.items.map { .init(item: $0.id, status: .declined) }
         )
-        let r = SmartHealthCheckinValidator.crossValidate(request: req, response: resp)
-        XCTAssertTrue(r.errors.contains { $0.message.contains("not in accept[]") })
+        let c = SmartHealthCheckinValidator.crossCheck(request: req, response: resp)
+        XCTAssertFalse(c.report.hasErrors, "only that Artifact is affected ([XV-4], [XV-7])")
+        XCTAssertEqual(c.disregardedArtifacts.map(\.id), ["a"])
+        XCTAssertTrue(c.disregardedArtifacts[0].reason.contains("not in accept[]"))
+        XCTAssertTrue(c.usableArtifacts.isEmpty)
     }
 
     func testRejectsMissingStatusEntry() {
@@ -228,8 +257,11 @@ final class CrossValidationTests: XCTestCase {
             requestId: "demo-1", artifacts: [],
             requestStatus: [ .init(item: "patient", status: .declined) ] // missing intake + summary
         )
-        let r = SmartHealthCheckinValidator.crossValidate(request: req, response: resp)
-        XCTAssertEqual(r.errors.filter { $0.path == "$.requestStatus" }.count, 2)
+        let c = SmartHealthCheckinValidator.crossCheck(request: req, response: resp)
+        XCTAssertFalse(c.report.hasErrors, "[XV-3] a missing row affects only that item")
+        XCTAssertEqual(c.itemOutcomes["patient"], .status(.declined))
+        XCTAssertEqual(c.itemOutcomes["intake"], .unknown(reason: "no status row"))
+        XCTAssertEqual(c.itemOutcomes["summary"], .unknown(reason: "no status row"))
     }
 
     func testRejectsDuplicateStatusEntry() {
@@ -243,8 +275,10 @@ final class CrossValidationTests: XCTestCase {
                 .init(item: "summary", status: .declined)
             ]
         )
-        let r = SmartHealthCheckinValidator.crossValidate(request: req, response: resp)
-        XCTAssertTrue(r.errors.contains { $0.message.contains("duplicate status entry") })
+        let c = SmartHealthCheckinValidator.crossCheck(request: req, response: resp)
+        XCTAssertFalse(c.report.hasErrors, "[XV-3] a doubled row affects only that item")
+        XCTAssertEqual(c.itemOutcomes["patient"], .unknown(reason: "2 status rows"))
+        XCTAssertEqual(c.itemOutcomes["intake"], .status(.declined))
     }
 
     func testFulfillsMustReferenceRealItem() {
@@ -255,7 +289,9 @@ final class CrossValidationTests: XCTestCase {
                                         value: .object([("resourceType", .string("Patient"))])))],
             requestStatus: req.items.map { .init(item: $0.id, status: .declined) }
         )
-        let r = SmartHealthCheckinValidator.crossValidate(request: req, response: resp)
-        XCTAssertTrue(r.errors.contains { $0.message.contains("no request item with id") })
+        let c = SmartHealthCheckinValidator.crossCheck(request: req, response: resp)
+        XCTAssertFalse(c.report.hasErrors)
+        XCTAssertEqual(c.disregardedArtifacts.map(\.id), ["x"])
+        XCTAssertTrue(c.disregardedArtifacts[0].reason.contains("not a request item"))
     }
 }

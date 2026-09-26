@@ -11,6 +11,26 @@ public struct SmartHealthCheckinResponse: Equatable, Sendable {
     public var artifacts: [Artifact]
     public var requestStatus: [RequestItemStatus]
     public var extensionMembers: [(key: String, value: JSONValue)]
+    /// Artifacts that failed a structural check while parsing ([XV-4], [XV-5],
+    /// [XV-8], [XV-9]). They are set aside, not fatal; `artifacts` holds the rest.
+    public var disregardedArtifacts: [DisregardedEntry]
+    /// `requestStatus` rows that failed a structural check while parsing, such
+    /// as an unknown status code ([XV-3]). The item they name has no valid status.
+    public var disregardedStatus: [DisregardedEntry]
+
+    /// A response entry set aside while parsing, kept verbatim so the response
+    /// still round-trips.
+    public struct DisregardedEntry: Equatable, Sendable {
+        /// Position in the source array.
+        public var index: Int
+        /// The Artifact `id`, or the status row's `item`, if one could be read.
+        public var id: String?
+        public var reason: String
+        public var raw: JSONValue
+        public init(index: Int, id: String?, reason: String, raw: JSONValue) {
+            self.index = index; self.id = id; self.reason = reason; self.raw = raw
+        }
+    }
 
     public init(
         requestId: String,
@@ -18,17 +38,23 @@ public struct SmartHealthCheckinResponse: Equatable, Sendable {
         requestStatus: [RequestItemStatus],
         version: String = SmartHealthCheckinConstants.modelVersion,
         type: String = SmartHealthCheckinConstants.responseType,
-        extensionMembers: [(key: String, value: JSONValue)] = []
+        extensionMembers: [(key: String, value: JSONValue)] = [],
+        disregardedArtifacts: [DisregardedEntry] = [],
+        disregardedStatus: [DisregardedEntry] = []
     ) {
         self.type = type; self.version = version
         self.requestId = requestId
         self.artifacts = artifacts; self.requestStatus = requestStatus
         self.extensionMembers = extensionMembers
+        self.disregardedArtifacts = disregardedArtifacts
+        self.disregardedStatus = disregardedStatus
     }
 
     public static func == (lhs: SmartHealthCheckinResponse, rhs: SmartHealthCheckinResponse) -> Bool {
         guard lhs.type == rhs.type, lhs.version == rhs.version, lhs.requestId == rhs.requestId,
               lhs.artifacts == rhs.artifacts, lhs.requestStatus == rhs.requestStatus,
+              lhs.disregardedArtifacts == rhs.disregardedArtifacts,
+              lhs.disregardedStatus == rhs.disregardedStatus,
               lhs.extensionMembers.count == rhs.extensionMembers.count
         else { return false }
         for (i, m) in lhs.extensionMembers.enumerated() {
@@ -182,12 +208,31 @@ public extension SmartHealthCheckinResponse {
         o.append(("type", .string(type)))
         o.append(("version", .string(version)))
         o.append(("requestId", .string(requestId)))
-        o.append(("artifacts", .array(artifacts.map { $0.toJSON() })))
-        o.append(("requestStatus", .array(requestStatus.map { $0.toJSON() })))
+        o.append(("artifacts", .array(Self.merge(artifacts.map { $0.toJSON() }, disregardedArtifacts))))
+        o.append(("requestStatus", .array(Self.merge(requestStatus.map { $0.toJSON() }, disregardedStatus))))
         for em in extensionMembers { o.append((em.key, em.value)) }
         return .object(o)
     }
 
+    /// Put set-aside entries back at their source positions.
+    internal static func merge(_ kept: [JSONValue], _ set: [DisregardedEntry]) -> [JSONValue] {
+        if set.isEmpty { return kept }
+        var out: [JSONValue] = []
+        var k = kept.makeIterator()
+        let byIndex = Dictionary(set.map { ($0.index, $0.raw) }, uniquingKeysWith: { a, _ in a })
+        for i in 0..<(kept.count + set.count) {
+            if let raw = byIndex[i] { out.append(raw) } else if let next = k.next() { out.append(next) }
+        }
+        while let next = k.next() { out.append(next) }
+        return out
+    }
+
+    /// Parse a SMART response. Only problems with the response as a whole
+    /// throw ([XV-1]): not a JSON object, duplicate member names, a wrong
+    /// `type` or `version`, or `artifacts`/`requestStatus` that is not an
+    /// array. A malformed Artifact or status row is set aside in
+    /// `disregardedArtifacts`/`disregardedStatus` ([XV-3], [XV-4]), and
+    /// Artifacts sharing an `id` are all set aside ([XV-5]).
     static func fromJSON(_ v: JSONValue) throws -> SmartHealthCheckinResponse {
         guard let members = v.objectMembers else { throw ModelDecodeError.expectedObject(path: "$") }
         var type: String?, version: String?, requestId: String?
@@ -210,15 +255,46 @@ public extension SmartHealthCheckinResponse {
             }
         }
         guard let type = type else { throw ModelDecodeError.missing(path: "$.type") }
+        guard type == SmartHealthCheckinConstants.responseType else {
+            throw ModelDecodeError.invalid(path: "$.type", reason: "must be '\(SmartHealthCheckinConstants.responseType)'")
+        }
         guard let version = version else { throw ModelDecodeError.missing(path: "$.version") }
+        guard version == SmartHealthCheckinConstants.modelVersion else {
+            throw ModelDecodeError.invalid(path: "$.version", reason: "must be '\(SmartHealthCheckinConstants.modelVersion)'")
+        }
         guard let requestId = requestId else { throw ModelDecodeError.missing(path: "$.requestId") }
         guard let artifactsRaw = artifactsRaw else { throw ModelDecodeError.missing(path: "$.artifacts") }
         guard let statusRaw = statusRaw else { throw ModelDecodeError.missing(path: "$.requestStatus") }
-        let artifacts = try artifactsRaw.enumerated().map { try Artifact.fromJSON($1, path: "$.artifacts[\($0)]") }
-        let requestStatus = try statusRaw.enumerated().map { try RequestItemStatus.fromJSON($1, path: "$.requestStatus[\($0)]") }
+
+        var parsed: [(index: Int, artifact: Artifact)] = []
+        var setAside: [DisregardedEntry] = []
+        for (i, raw) in artifactsRaw.enumerated() {
+            do { parsed.append((i, try Artifact.fromJSON(raw, path: "$.artifacts[\(i)]"))) }
+            catch { setAside.append(.init(index: i, id: raw["id"]?.stringValue, reason: String(describing: error), raw: raw)) }
+        }
+        // [XV-5] Artifacts that share an id are all disregarded.
+        var idCounts: [String: Int] = [:]
+        for p in parsed { idCounts[p.artifact.id, default: 0] += 1 }
+        var artifacts: [Artifact] = []
+        for p in parsed {
+            if idCounts[p.artifact.id, default: 0] > 1 {
+                setAside.append(.init(index: p.index, id: p.artifact.id, reason: "another Artifact has the id '\(p.artifact.id)'", raw: artifactsRaw[p.index]))
+            } else {
+                artifacts.append(p.artifact)
+            }
+        }
+        setAside.sort { $0.index < $1.index }
+
+        var requestStatus: [RequestItemStatus] = []
+        var statusSetAside: [DisregardedEntry] = []
+        for (i, raw) in statusRaw.enumerated() {
+            do { requestStatus.append(try RequestItemStatus.fromJSON(raw, path: "$.requestStatus[\(i)]")) }
+            catch { statusSetAside.append(.init(index: i, id: raw["item"]?.stringValue, reason: String(describing: error), raw: raw)) }
+        }
         return SmartHealthCheckinResponse(
             requestId: requestId, artifacts: artifacts, requestStatus: requestStatus,
-            version: version, type: type, extensionMembers: extras
+            version: version, type: type, extensionMembers: extras,
+            disregardedArtifacts: setAside, disregardedStatus: statusSetAside
         )
     }
 }

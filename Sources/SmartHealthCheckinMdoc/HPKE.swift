@@ -91,6 +91,34 @@ public enum DCAPIResponse {
     }
 }
 
+public extension DCAPIResponse {
+    /// Receiver-side decode ([VRS-2]): fails only without `enc` or
+    /// `cipherText`; a first entry other than "dcapi" is a warning.
+    static func decodeLenient(_ data: Data) throws -> (enc: Data, ciphertext: Data, warnings: [CheckinWarning]) {
+        let v = try CBORDecoder.lenient.decode(data)
+        var warnings: [CheckinWarning] = []
+        let fields: CBOR
+        if case .array(let xs) = v, xs.count == 2 {
+            if case .textString(let tag) = xs[0], tag == "dcapi" {} else {
+                warnings.append(.init("dcapi-response", "the response's first entry is not \"dcapi\""))
+            }
+            fields = xs[1]
+        } else {
+            throw DCAPIResponseError.malformed
+        }
+        guard case .map(let entries) = fields else { throw DCAPIResponseError.malformed }
+        var enc: Data?, ct: Data?
+        for e in entries {
+            if case .textString(let k) = e.key {
+                if k == "enc", case .byteString(let d) = e.value { enc = d }
+                if k == "cipherText", case .byteString(let d) = e.value { ct = d }
+            }
+        }
+        guard let enc = enc, let ct = ct else { throw DCAPIResponseError.malformed }
+        return (enc, ct, warnings)
+    }
+}
+
 public enum DCAPIResponseError: Error, Equatable, Sendable {
     case malformed
 }
@@ -130,6 +158,33 @@ public enum EncryptionInfo {
         let parsed = try COSEKey.decodeP256(coseKey)
         let pub = try parsed.asKeyAgreementKey()
         return (nonce, pub)
+    }
+}
+
+public extension EncryptionInfo {
+    /// Wallet-side decode ([WRQ-7]): fails only when there is no usable P-256
+    /// `recipientPublicKey`; any other problem with the shape is a warning.
+    static func decodeLenient(_ data: Data) throws -> (nonce: Data?, recipientPublicKey: P256.KeyAgreement.PublicKey, warnings: [CheckinWarning]) {
+        let v = try CBORDecoder.lenient.decode(data)
+        var warnings: [CheckinWarning] = []
+        guard case .array(let xs) = v, xs.count == 2, case .map(let entries) = xs[1] else {
+            throw EncryptionInfoError.malformed
+        }
+        if case .textString(let tag) = xs[0], tag == "dcapi" {} else {
+            warnings.append(.init("encryption-info", "encryptionInfo's first entry is not \"dcapi\""))
+        }
+        var nonce: Data?
+        var coseKey: CBOR?
+        for e in entries {
+            if case .textString(let k) = e.key {
+                if k == "nonce", case .byteString(let d) = e.value { nonce = d }
+                if k == "recipientPublicKey" { coseKey = e.value }
+            }
+        }
+        if nonce == nil { warnings.append(.init("encryption-info", "encryptionInfo has no nonce byte string")) }
+        guard let coseKey = coseKey else { throw EncryptionInfoError.malformed }
+        let pub = try COSEKey.decodeP256(coseKey).asKeyAgreementKey()
+        return (nonce, pub, warnings)
     }
 }
 

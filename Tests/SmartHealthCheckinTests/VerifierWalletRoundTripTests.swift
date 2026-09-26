@@ -163,8 +163,9 @@ final class VerifierWalletRoundTripTests: XCTestCase {
             ))],
             requestStatus: [.init(item: "imm", status: .fulfilled)]
         )
-        let report = SmartHealthCheckinValidator.crossValidate(request: req, response: badResp)
-        XCTAssertTrue(report.hasErrors)
-        XCTAssertTrue(report.errors.contains { $0.message.contains("not in accept[]") })
+        let check = SmartHealthCheckinValidator.crossCheck(request: req, response: badResp)
+        XCTAssertFalse(check.report.hasErrors, "[XV-7] only that Artifact is disregarded")
+        XCTAssertEqual(check.disregardedArtifacts.map(\.id), ["imm-1"])
+        XCTAssertTrue(check.disregardedArtifacts[0].reason.contains("not in accept[]"))
     }
 }

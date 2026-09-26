@@ -24,6 +24,9 @@ let package = Package(
         // swift-certificates lets us pull the P-256 public key out of an
         // x5chain leaf certificate without hand-rolling DER parsing.
         .package(url: "https://github.com/apple/swift-certificates.git", from: "1.5.0"),
+        // DER serialization for the self-signed certificates the wallet and
+        // reader attach in x5chain ([WRS-4], [RA-1]).
+        .package(url: "https://github.com/apple/swift-asn1.git", from: "1.0.0"),
     ],
     targets: [
         .target(
@@ -41,6 +44,7 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "_CryptoExtras", package: "swift-crypto"),
                 .product(name: "X509", package: "swift-certificates"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
             ],
             path: "Sources/SmartHealthCheckinMdoc"
         ),
