@@ -18,11 +18,10 @@ The package exposes both **Verifier** (clinic / kiosk) and **Wallet** (patient a
 ## Install
 
 ```swift
-.package(url: "https://github.com/smart-health-checkin/swift.git", branch: "main")
+.package(url: "https://github.com/smart-health-checkin/swift.git", from: "0.1.0")
 ```
 
-There is no tagged release yet. Once there is, depend on a version instead
-(`from: "0.1.0"`); releases are `vX.Y.Z` tags.
+Releases are `vX.Y.Z` tags; `from:` takes any later compatible one.
 
 Then, depending on what you need:
 
