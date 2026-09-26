@@ -18,8 +18,11 @@ The package exposes both **Verifier** (clinic / kiosk) and **Wallet** (patient a
 ## Install
 
 ```swift
-.package(url: "https://github.com/joshuamandel/smart-health-checkin-ios.git", from: "0.1.0")
+.package(url: "https://github.com/smart-health-checkin/swift.git", branch: "main")
 ```
+
+There is no tagged release yet. Once there is, depend on a version instead
+(`from: "0.1.0"`); releases are `vX.Y.Z` tags.
 
 Then, depending on what you need:
 
@@ -27,7 +30,7 @@ Then, depending on what you need:
 .target(
     name: "MyApp",
     dependencies: [
-        .product(name: "SmartHealthCheckin", package: "smart-health-checkin-ios"),
+        .product(name: "SmartHealthCheckin", package: "swift"),
     ]
 )
 ```
