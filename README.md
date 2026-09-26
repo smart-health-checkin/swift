@@ -39,7 +39,7 @@ Targets exposed (use the most specific one you need):
 | Library                                         | What you get                                                       |
 | ----------------------------------------------- | ------------------------------------------------------------------ |
 | `SmartHealthCheckin`                            | High-level `CheckinVerifier` / `CheckinWallet` facades             |
-| `SmartHealthCheckinModel`                       | §5/§6 clinical JSON model + strict parser + §6.4 cross‑validation  |
+| `SmartHealthCheckinModel`                       | [§5](https://smart-health-checkin.org/spec/#5-clinical-request-model)/[§6](https://smart-health-checkin.org/spec/#6-clinical-response-model) clinical JSON model + strict parser + [§6.4](https://smart-health-checkin.org/spec/#6-4-verifier-cross-validation) cross‑validation  |
 | `SmartHealthCheckinCBOR`                        | Deterministic CBOR codec, Tag(24) helpers, byte-range slice extraction |
 | `SmartHealthCheckinMdoc`                        | COSE_Key, COSE_Sign1, SessionTranscript, DeviceRequest/Response, HPKE wrappers, x509 cert helpers |
 
@@ -91,11 +91,11 @@ for item in request.items {
 ```
 
 The Verifier is strict about what it builds and permissive about what it
-receives (§2 [RCV-0]..[RCV-2]). Signature, digest, MSO, validity, version, and
+receives ([§2](https://smart-health-checkin.org/spec/#2-terminology-and-conventions) [RCV-0](https://smart-health-checkin.org/spec/#RCV-0)..[RCV-2](https://smart-health-checkin.org/spec/#RCV-2)). Signature, digest, MSO, validity, version, and
 padding problems don't throw: they come back in `result.warnings` with a short
 code (`issuer-signature`, `device-signature`, `digest`, `mso-validity`, …), and
 the individual booleans (`issuerSignatureValid`, `deviceSignatureValid`,
-`valueDigestMatches`) stay available. §6.4 problems affect one Artifact or one
+`valueDigestMatches`) stay available. [§6.4](https://smart-health-checkin.org/spec/#6-4-verifier-cross-validation) problems affect one Artifact or one
 item: `result.crossCheck` lists the usable Artifacts, the disregarded ones with
 reasons, and each item's outcome. `result.allChecksPass` is `true` only when
 there are no warnings of either kind.
@@ -160,7 +160,7 @@ let dcapiResponseB64u = try parsed.assembler.reply(
 `reply` refuses to build a response a strict Verifier would reject or partly
 disregard (a missing or doubled status row, an Artifact whose media type the
 item doesn't accept, and so on). A Holder who declines everything is answered
-with every item `declined` ([HOLD-4]).
+with every item `declined` ([HOLD-4](https://smart-health-checkin.org/spec/#HOLD-4)).
 
 On iOS, the Identity Document Provider extension sees `requestInfo` only once
 the patient interacts: call `handleRequest` inside `sendResponse`, with
@@ -201,20 +201,20 @@ let digest = SHA256.hash(data: itemSlice.source)
 
 ## Spec compliance notes
 
-The library bakes in the spec's load‑bearing details:
+The library bakes in the [spec](https://smart-health-checkin.org/spec/)'s load‑bearing details:
 
 - Identifiers are fixed: docType `org.smarthealthit.checkin.1`, namespace `org.smarthealthit.checkin`, element `smart_health_checkin_response`, request carrier key `org.smarthealthit.checkin.request`.
-- The SMART JSON request body sits in `requestInfo[carrierKey]` as a CBOR **text string** (not a map, not base64url) per §8.2.
-- §5.1 strictness: the JSON parser rejects duplicate object members. Foundation's `JSONDecoder` and `JSONSerialization` silently accept them; the library does not use them.
+- The SMART JSON request body sits in `requestInfo[carrierKey]` as a CBOR **text string** (not a map, not base64url) per [§8.2](https://smart-health-checkin.org/spec/#8-2-verifier-request-construction).
+- [§5.1](https://smart-health-checkin.org/spec/#5-1-encoding-rules) strictness: the JSON parser rejects duplicate object members. Foundation's `JSONDecoder` and `JSONSerialization` silently accept them; the library does not use them.
 - COSE_Sign1 ES256 signatures are raw `R || S` (64 bytes), not DER.
 - `issuerAuth` payload is `Tag(24, bstr .cbor MSO)` (attached), with the issuer certificate in `x5chain` (label 33, unprotected). `deviceSignature` and `readerAuth` payloads are **detached** (`nil`): the receiver rebuilds `DeviceAuthenticationBytes` / `ReaderAuthenticationBytes` from its own `SessionTranscript`. A received attached device payload that differs from the rebuilt bytes doesn't verify.
 - The MSO carries `validityInfo` (`signed` = `validFrom` = signing time, whole seconds, UTC).
 - Map ordering is RFC 8949 deterministic; non-shortest int / length encodings are rejected.
 - HPKE: DHKEM(P‑256, HKDF‑SHA256) + HKDF‑SHA256 + AES‑128‑GCM, `info = SessionTranscript`, `aad = h''`, base mode.
 - `DeviceAuthentication` binds the **exact** received `deviceSigned.nameSpaces` tag‑24 bytes — the library does not hardcode `{}`.
-- The SessionTranscript origin is the ASCII serialization of the web origin, no trailing slash ([TR-2]); `CheckinOrigin.serialize` normalizes a platform-supplied URL.
-- Receivers fail only where §8 says so and warn otherwise ([RCV-0]..[RCV-2]). A malformed selector makes only its item `unsupported`; a malformed Artifact or status row affects only itself ([XV-3], [XV-4]).
-- §6.4 cross‑validation (`SmartHealthCheckinValidator.crossCheck`): an Artifact is usable only if every item it lists exists and accepts its `mediaType`, its FHIR release is one the request listed, and a `QuestionnaireResponse` echoes the requested canonical exactly.
+- The SessionTranscript origin is the ASCII serialization of the web origin, no trailing slash ([TR-2](https://smart-health-checkin.org/spec/#TR-2)); `CheckinOrigin.serialize` normalizes a platform-supplied URL.
+- Receivers fail only where [§8](https://smart-health-checkin.org/spec/#8-same-device-presentation-flow) says so and warn otherwise ([RCV-0](https://smart-health-checkin.org/spec/#RCV-0)..[RCV-2](https://smart-health-checkin.org/spec/#RCV-2)). A malformed selector makes only its item `unsupported`; a malformed Artifact or status row affects only itself ([XV-3](https://smart-health-checkin.org/spec/#XV-3), [XV-4](https://smart-health-checkin.org/spec/#XV-4)).
+- [§6.4](https://smart-health-checkin.org/spec/#6-4-verifier-cross-validation) cross‑validation (`SmartHealthCheckinValidator.crossCheck`): an Artifact is usable only if every item it lists exists and accepts its `mediaType`, its FHIR release is one the request listed, and a `QuestionnaireResponse` echoes the requested canonical exactly.
 
 ## Testing
 
@@ -227,7 +227,7 @@ swift test
 JSON, cross-validation, request CBOR, transcript, HPKE, mdoc verification) and
 must pass them all: `conformance/known-failures.json` lists none. For warning
 cases it also checks the expected warning code is reported. CI then checks the
-credentials this wallet builds with the spec's reference verifier.
+credentials this wallet builds with the spec's [reference verifier](https://github.com/smart-health-checkin/spec/tree/main/conformance/reference).
 
 Both read the spec at a pinned tag (`SPEC_REF` in `scripts/fetch-spec.sh`,
 currently `v1.0.0-draft.1`). Set `SPEC_DIR=../spec` to test against a local
@@ -248,10 +248,10 @@ Executed 4 tests, with 0 failures
 
 The library implements the protocol; production deployments still need to:
 
-- Decide what, if anything, to trust beyond integrity. Signatures show the mdoc is intact and well formed, not who issued it (§7); supply `trustedIssuerKeys` only if a deployment profile defines trusted issuers.
+- Decide what, if anything, to trust beyond integrity. Signatures show the mdoc is intact and well formed, not who issued it ([§7](https://smart-health-checkin.org/spec/#7-trust-framework)); supply `trustedIssuerKeys` only if a deployment profile defines trusted issuers.
 - Bind to the authenticated origin from the platform credential manager / browser. Never accept an origin from inside the SMART JSON body.
 - Treat the verifier's `VerifierRetainedState` as ephemeral session state. Rotate per request.
-- Look at `result.warnings`: an MSO outside its validity window is reported as `mso-validity` ([VRS-10]), not rejected.
+- Look at `result.warnings`: an MSO outside its validity window is reported as `mso-validity` ([VRS-10](https://smart-health-checkin.org/spec/#VRS-10)), not rejected.
 - Handle `intentToRetain = false` semantics in your data layer.
 
 ## License
