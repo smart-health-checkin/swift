@@ -41,7 +41,10 @@ final class SpecConformanceTests: XCTestCase {
             ran += 1
             let passed = (try? run(c)) ?? false
             print("CONFORMANCE \(passed ? "pass" : "fail") \(id)")
-            if known[id] != nil {
+            if capability == "wallet-response" {
+                // Here we only build the credential; the reference verifier judges it (and applies known failures).
+                if !passed { unexpectedFailures.append("\(id): couldn't build a credential") }
+            } else if known[id] != nil {
                 if passed { unexpectedPasses.append(id) }
             } else if !passed {
                 unexpectedFailures.append("\(id): \(c["description"] as! String)")
