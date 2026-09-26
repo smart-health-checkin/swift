@@ -123,7 +123,8 @@ final class SpecConformanceTests: XCTestCase {
         case "hpke-open":
             return judge(c) {
                 let plaintext = try open(c)
-                return !hasOutput(c, "deviceResponse") || plaintext == (try output(c, "deviceResponse"))
+                if !hasOutput(c, "deviceResponse") { return true }
+                return plaintext == (try output(c, "deviceResponse"))
             }
         case "mdoc-verify":
             return judge(c) {
