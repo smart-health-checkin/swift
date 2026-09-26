@@ -151,11 +151,15 @@ final class SpecConformanceTests: XCTestCase {
         }
     }
 
-    /// The host's job: pick the org-iso-mdoc entry from the navigator.credentials.get argument.
+    /// The host's job: pick the mdoc entry from the navigator.credentials.get
+    /// argument. The package never sees `protocol`; like the other runners'
+    /// hosts, this one prefers org-iso-mdoc and otherwise takes the first
+    /// entry with mdoc data (a wrong protocol is a warning, WRQ-2).
     private func mdocRequestData(_ json: Data) throws -> (String, String) {
         let arg = try JSONSerialization.jsonObject(with: json) as! [String: Any]
-        let requests = (arg["digital"] as? [String: Any])?["requests"] as? [[String: Any]] ?? []
-        for r in requests where (r["protocol"] as? String) == "org-iso-mdoc" {
+        let all = (arg["digital"] as? [String: Any])?["requests"] as? [[String: Any]] ?? []
+        let requests = all.filter { ($0["protocol"] as? String) == "org-iso-mdoc" } + all.filter { ($0["protocol"] as? String) != "org-iso-mdoc" }
+        for r in requests {
             if let d = r["data"] as? [String: Any], let dr = d["deviceRequest"] as? String, let ei = d["encryptionInfo"] as? String {
                 return (dr, ei)
             }
