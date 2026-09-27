@@ -228,10 +228,10 @@ cases it also checks the expected warning code is reported. CI then checks the
 credentials this wallet builds with the spec's [reference verifier](https://github.com/smart-health-checkin/spec/tree/main/conformance/reference).
 
 Both read the spec at a pinned tag (`SPEC_REF` in `scripts/fetch-spec.sh`,
-currently `v1.0.0-draft.1`). Set `SPEC_DIR=../spec` to test against a local
+currently `v1.0.0-draft.2`). Set `SPEC_DIR=../spec` to test against a local
 spec checkout.
 
-Unit tests cover the model layer, CBOR determinism and slice extraction, a COSE_Sign1 round trip, HPKE seal and open, DeviceRequest and DeviceResponse building and parsing with positive and negative cases, and a Verifier-to-Wallet round trip. A fixture test (`SampleFixtureTests`) decodes a captured `DigitalCredentialsRequest` ([`sample.json`](Tests/SmartHealthCheckinTests/Fixtures/sample.json)) and verifies its `readerAuth` against the embedded leaf certificate.
+Unit tests cover the model layer, CBOR determinism and slice extraction, a COSE_Sign1 round trip, HPKE seal and open, DeviceRequest and DeviceResponse building and parsing with positive and negative cases, and a Verifier-to-Wallet round trip. A fixture test (`SampleFixtureTests`) decodes a captured `DigitalCredentialsRequest` ([`sample.json`](Tests/SmartHealthCheckinTests/Fixtures/sample.json), a copy of the spec's [`android-chrome-capture`](https://github.com/smart-health-checkin/spec/tree/main/fixtures/dcapi-requests/android-chrome-capture) request: Chrome on Android, client library 0.4.4, reference wallet 0.4.3) and verifies its `readerAuth` against the embedded leaf certificate under the capture's origin.
 
 ## Threat model and responsibilities
 
