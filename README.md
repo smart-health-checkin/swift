@@ -6,7 +6,7 @@ A Swift Package implementing **[SMART Health Check‑in 1.0](https://smart-healt
 
 The package exposes both **Verifier** (clinic / kiosk) and **Wallet** (patient app) roles, plus the underlying primitives (clinical model, deterministic CBOR, COSE_Sign1, HPKE binding, x509) so applications can compose their own flows.
 
-> **Status:** spec-complete. Round-trips against the [official demo's published `DigitalCredentialsRequest`](./sample.json) — every CBOR / COSE / HPKE byte boundary is byte-compatible.
+> **Status:** spec-complete. Round-trips against the [official demo's published `DigitalCredentialsRequest`](Tests/SmartHealthCheckinTests/Fixtures/sample.json) — every CBOR / COSE / HPKE byte boundary is byte-compatible.
 
 ## Requirements
 
