@@ -19,6 +19,6 @@ jobs:
       - name: Check wallet output with the reference verifier
         run: |
           cd spec-conformance
-          bun add --silent https://github.com/smart-health-checkin/client/releases/download/v0.2.2/smart-health-checkin-client-0.2.2.tgz
+          bun add --silent https://github.com/smart-health-checkin/client/releases/download/v0.4.3/smart-health-checkin-client-0.4.3.tgz
           cd ..
           bun spec-conformance/reference/verify-wallet-output.ts .build/conformance-wallet conformance/known-failures.json
