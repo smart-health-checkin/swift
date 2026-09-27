@@ -1,12 +1,10 @@
 # SmartHealthCheckin
 
-> Moved out of [smart-health-checkin/spec](https://github.com/smart-health-checkin/spec) (`examples/swift-ios`) with its history. There's no reference iOS wallet for the connectathon; this package is exploratory.
-
-A Swift Package implementing **[SMART Health Check‑in 1.0](https://smart-health-checkin.org/spec/llms.txt)** — a same‑device W3C Digital Credentials API protocol for clinical check‑in, layered on top of `org-iso-mdoc` (CBOR + COSE_Sign1 + HPKE).
+A Swift Package implementing **[SMART Health Check‑in 1.0](https://smart-health-checkin.org/spec/)**, a same‑device W3C Digital Credentials API protocol for clinical check‑in, layered on top of `org-iso-mdoc` (CBOR + COSE_Sign1 + HPKE).
 
 The package exposes both **Verifier** (clinic / kiosk) and **Wallet** (patient app) roles, plus the underlying primitives (clinical model, deterministic CBOR, COSE_Sign1, HPKE binding, x509) so applications can compose their own flows.
 
-> **Status:** spec-complete. Round-trips against the [official demo's published `DigitalCredentialsRequest`](Tests/SmartHealthCheckinTests/Fixtures/sample.json) — every CBOR / COSE / HPKE byte boundary is byte-compatible.
+It implements the whole spec and passes every spec conformance case ([Testing](#testing)). There is no reference iOS wallet app built on it yet.
 
 ## Requirements
 
@@ -233,18 +231,9 @@ Both read the spec at a pinned tag (`SPEC_REF` in `scripts/fetch-spec.sh`,
 currently `v1.0.0-draft.1`). Set `SPEC_DIR=../spec` to test against a local
 spec checkout.
 
-Unit tests cover the model layer, CBOR determinism + slice extraction, COSE_Sign1 round‑trip, HPKE seal/open, DeviceRequest + DeviceResponse build/parse with positive and negative cases, and a Verifier ↔ Wallet integration round‑trip. Plus a fixture test that decodes the actual demo's published `DigitalCredentialsRequest` (`sample.json`) and verifies its `readerAuth` COSE_Sign1 against the embedded leaf cert — this is the strongest proof that the library is byte-compatible with the demo wire format.
+Unit tests cover the model layer, CBOR determinism and slice extraction, a COSE_Sign1 round trip, HPKE seal and open, DeviceRequest and DeviceResponse building and parsing with positive and negative cases, and a Verifier-to-Wallet round trip. A fixture test (`SampleFixtureTests`) decodes a captured `DigitalCredentialsRequest` ([`sample.json`](Tests/SmartHealthCheckinTests/Fixtures/sample.json)) and verifies its `readerAuth` against the embedded leaf certificate.
 
-```
-$ swift test --filter SampleFixtureTests
-…
-Test Case 'SampleFixtureTests.testReaderAuthVerifiesAgainstLeafCert' started …
-readerAuth verified against origin: https://joshuamandel.com
-…
-Executed 4 tests, with 0 failures
-```
-
-## Threat model & responsibilities
+## Threat model and responsibilities
 
 The library implements the protocol; production deployments still need to:
 

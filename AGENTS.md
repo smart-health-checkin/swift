@@ -15,6 +15,6 @@ The Swift package. Swift Package Manager installs it from `vX.Y.Z` tags.
   reference verifier. `conformance/known-failures.json` is empty; keep it that
   way (a new failure is a bug, not a list entry, unless a spec decision is
   pending).
-- Receivers are permissive, producers strict (spec §2 RCV-0..2, decision D16):
+- Receivers are permissive, producers strict (spec [§2](https://smart-health-checkin.org/spec/#2-terminology-and-conventions), RCV-0..2):
   receiver-side problems become `CheckinWarning`s with the conformance codes,
   and only the steps §8 marks **fail** throw.
