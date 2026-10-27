@@ -4,7 +4,7 @@ A Swift Package implementing **[SMART Health Check‑in 1.0](https://smart-healt
 
 The package exposes both **Verifier** (clinic / kiosk) and **Wallet** (patient app) roles, plus the underlying primitives (clinical model, deterministic CBOR, COSE_Sign1, HPKE binding, x509) so applications can compose their own flows.
 
-It implements the whole spec and passes every spec conformance case ([Testing](#testing)). There is no reference iOS wallet app built on it yet.
+It implements the whole spec and passes every spec conformance case ([Testing](#testing)). There is no reference iOS wallet app built on it yet; for an iOS wallet's Identity Document Provider extension, see [ios-wallet-kit](https://github.com/smart-health-checkin/ios-wallet-kit).
 
 ## Requirements
 
